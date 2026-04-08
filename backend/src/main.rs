@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod db;
 mod errors;
+mod items;
 mod receipts;
 mod storage;
 
@@ -82,6 +83,10 @@ async fn main() {
             "/api/receipts/{id}/status",
             get(receipts::handlers::ocr_status),
         )
+        // Items
+        .route("/api/items", get(items::handlers::list))
+        .route("/api/items/{id}", put(items::handlers::update))
+        .route("/api/items/{id}", delete(items::handlers::delete))
         .with_state(state)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());

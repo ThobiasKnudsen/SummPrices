@@ -5,6 +5,7 @@ import '../providers/auth_provider.dart';
 import '../providers/receipt_provider.dart';
 import '../models/receipt.dart';
 import 'capture_screen.dart';
+import 'items_screen.dart';
 import 'receipt_detail_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -155,7 +156,7 @@ class _ItemsTab extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const Center(child: Text('Items - coming soon'));
+    return const ItemsScreen();
   }
 }
 
