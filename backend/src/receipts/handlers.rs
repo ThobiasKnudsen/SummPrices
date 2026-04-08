@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
@@ -9,11 +11,13 @@ use crate::errors::AppError;
 use crate::storage::s3::Storage;
 
 use super::models::*;
+use super::ocr::{self, TabscannerClient};
 
 pub async fn upload(
     auth: AuthUser,
     State(pool): State<PgPool>,
     State(storage): State<Storage>,
+    State(ocr_client): State<Arc<TabscannerClient>>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<Receipt>), AppError> {
     let mut image_data: Option<Vec<u8>> = None;
@@ -41,8 +45,12 @@ pub async fn upload(
     let image_data = image_data.ok_or_else(|| AppError::BadRequest("No image provided".into()))?;
     let image_key = format!("{}/{}.jpg", auth.user_id, Uuid::new_v4());
 
-    storage.upload(&image_key, &image_data, &content_type).await?;
+    // Upload to S3
+    storage
+        .upload(&image_key, &image_data, &content_type)
+        .await?;
 
+    // Insert receipt row
     let receipt = sqlx::query_as::<_, Receipt>(
         "INSERT INTO receipts (user_id, image_key, ocr_status)
          VALUES ($1, $2, 'pending')
@@ -54,6 +62,22 @@ pub async fn upload(
     .bind(&image_key)
     .fetch_one(&pool)
     .await?;
+
+    // Submit to Tabscanner in background (don't block the response)
+    let pool_clone = pool.clone();
+    let receipt_id = receipt.id;
+    let ocr = ocr_client.clone();
+    let ct = content_type.clone();
+    tokio::spawn(async move {
+        if let Err(e) = ocr::submit_for_ocr(&pool_clone, receipt_id, &image_data, &ct, &ocr).await
+        {
+            tracing::error!("OCR submission failed for receipt {receipt_id}: {e}");
+            let _ = sqlx::query("UPDATE receipts SET ocr_status = 'failed' WHERE id = $1")
+                .bind(receipt_id)
+                .execute(&pool_clone)
+                .await;
+        }
+    });
 
     Ok((StatusCode::CREATED, Json(receipt)))
 }
@@ -133,7 +157,10 @@ pub async fn get_one(
     .fetch_all(&pool)
     .await?;
 
-    let image_url = storage.get_presigned_url(&receipt.image_key, 3600).await.ok();
+    let image_url = storage
+        .get_presigned_url(&receipt.image_key, 3600)
+        .await
+        .ok();
 
     Ok(Json(ReceiptWithItems {
         receipt,
@@ -197,10 +224,11 @@ pub async fn delete(
 pub async fn ocr_status(
     auth: AuthUser,
     State(pool): State<PgPool>,
+    State(ocr_client): State<Arc<TabscannerClient>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<OcrStatusResponse>, AppError> {
-    let row = sqlx::query_as::<_, (String, Option<f32>)>(
-        "SELECT ocr_status, ocr_confidence FROM receipts WHERE id = $1 AND user_id = $2",
+    let row = sqlx::query_as::<_, (String, Option<f32>, Option<String>)>(
+        "SELECT ocr_status, ocr_confidence, ocr_token FROM receipts WHERE id = $1 AND user_id = $2",
     )
     .bind(id)
     .bind(auth.user_id)
@@ -208,8 +236,33 @@ pub async fn ocr_status(
     .await?
     .ok_or(AppError::NotFound)?;
 
+    let (mut status, confidence, ocr_token) = row;
+
+    // If still processing and we have a token, lazy-poll Tabscanner
+    if status == "processing" {
+        if let Some(token) = &ocr_token {
+            match ocr::poll_and_store(&pool, id, auth.user_id, token, &ocr_client).await {
+                Ok(new_status) => status = new_status,
+                Err(e) => tracing::warn!("OCR poll failed for receipt {id}: {e}"),
+            }
+        }
+    }
+
+    // Re-read confidence if status changed to done
+    let confidence = if status == "done" && confidence.is_none() {
+        sqlx::query_scalar::<_, Option<f32>>(
+            "SELECT ocr_confidence FROM receipts WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(None)
+    } else {
+        confidence
+    };
+
     Ok(Json(OcrStatusResponse {
-        ocr_status: row.0,
-        ocr_confidence: row.1,
+        ocr_status: status,
+        ocr_confidence: confidence,
     }))
 }

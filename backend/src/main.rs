@@ -5,18 +5,22 @@ mod errors;
 mod receipts;
 mod storage;
 
+use std::sync::Arc;
+
 use axum::Router;
 use axum::routing::{delete, get, post, put};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
+use crate::receipts::ocr::TabscannerClient;
 use crate::storage::s3::Storage;
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: sqlx::PgPool,
     pub storage: Storage,
+    pub ocr_client: Arc<TabscannerClient>,
 }
 
 impl axum::extract::FromRef<AppState> for sqlx::PgPool {
@@ -28,6 +32,12 @@ impl axum::extract::FromRef<AppState> for sqlx::PgPool {
 impl axum::extract::FromRef<AppState> for Storage {
     fn from_ref(state: &AppState) -> Self {
         state.storage.clone()
+    }
+}
+
+impl axum::extract::FromRef<AppState> for Arc<TabscannerClient> {
+    fn from_ref(state: &AppState) -> Self {
+        state.ocr_client.clone()
     }
 }
 
@@ -48,8 +58,13 @@ async fn main() {
         .expect("Failed to run migrations");
 
     let storage = Storage::new(&config);
+    let ocr_client = Arc::new(TabscannerClient::new(&config.tabscanner_api_key));
 
-    let state = AppState { pool, storage };
+    let state = AppState {
+        pool,
+        storage,
+        ocr_client,
+    };
 
     let app = Router::new()
         .route("/health", get(health))
