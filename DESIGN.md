@@ -33,7 +33,7 @@
 1. **Modular monolith**, not microservices. A Cargo **workspace of libraries + one axum binary**. Extract a service only when load/release cadence actually diverges. (The old spec's 3-microservice split is premature for a solo team.)
 2. **Two data domains, separated from day one** (§7):
    - **Operational / PII** — users, receipts, images, their line-item transactions. Tied to identity.
-   - **Anonymized price time-series** — item × price × store × time, **no user identity**. Survives GDPR account deletion; is the B2B asset.
+   - **Anonymized crowd/price data** — derived from `transactions` (aggregated, **no user identity**). Materialized into a retained de-identified store only when B2B / retention needs it (§7.3).
 3. **Thin client.** Flutter app = capture + upload + display + API calls. **No meaningful processing on the client** — Postgres, the backend, and the extraction service do the work.
 4. **Extraction behind a `ReceiptExtractor` trait** — the model/provider is a swappable implementation detail (§6).
 5. **GDPR-first** (§8). Self-hosting the model and keeping all data in the EU is a deliberate compliance + product advantage.
@@ -85,7 +85,7 @@ Flutter client ──HTTPS──> axum backend (modular monolith) ──> Postgr
 
 ## 7. Data model
 
-> **Star schema.** One big central **fact table** (`transactions` — every line item bought) surrounded by small **dimension tables** (`users`, `chains`, `stores`, `products`, `categories`) that it points to via foreign keys. A separate **price time-series** (`price_history` + `current_prices`) holds price-per-item-per-shop over time. Types are PostgreSQL; fixed-value columns use native `ENUM` types (§7.0). `PK` = primary key, `FK→x` = foreign key to table `x`. The fact table holds the FKs; dimension tables never carry a transaction id.
+> **Star schema.** One big central **fact table** (`transactions` — every line item bought) surrounded by small **dimension tables** (`users`, `chains`, `stores`, `products`, `categories`) that it points to via foreign keys. Crowd/price data is **derived from `transactions`** (aggregate queries), not a separate table at MVP (§7.3). Types are PostgreSQL; fixed-value columns use native `ENUM` types (§7.0). `PK` = primary key, `FK→x` = foreign key to table `x`. The fact table holds the FKs; dimension tables never carry a transaction id.
 
 ### 7.0 Enum types
 
@@ -188,9 +188,14 @@ Note: `gtin` is the universal item id when a barcode exists; many receipt lines 
 | dedup_signature | TEXT | UNIQUE(user_id, dedup_signature) | hash(user, store, date, total, item_count) |
 | txn_signature | TEXT | | hash(org_no, purchase_at, total) — cross-user dup (later) |
 | fraud_status | `fraud_status` | NOT NULL, default 'ok' | |
+| extraction_attempts | INT | NOT NULL, default 0 | retry counter for the queue |
+| extraction_error | TEXT | | last failure message |
+| next_attempt_at | TIMESTAMPTZ | | backoff time for retries |
 | created_at / updated_at | TIMESTAMPTZ | NOT NULL, default now() | |
 
 *Indexes:* `(user_id, purchase_at DESC)`; `store_id`; `extraction_status` (partial, active states) for the queue; `txn_signature`.
+
+The `receipts` table **is** the extraction queue — the worker polls `WHERE extraction_status IN ('pending','queued') … FOR UPDATE SKIP LOCKED`. A generic `jobs` table is only worth it once job types multiply (§7.8).
 
 **`transactions`** — **the central fact table: one row per purchased line item.** Biggest table; references every dimension.
 
@@ -218,45 +223,16 @@ Note: `gtin` is the universal item id when a barcode exists; many receipt lines 
 
 *Indexes:* `(user_id, description_clean)` for "item Y over time"; `(product_id, occurred_at)`; `(store_id, occurred_at)`; `receipt_id`; `category_id`.
 
-### 7.3 Price time-series (item × physical shop over time — the price index)
+### 7.3 Crowd / price index — derived, not stored (yet)
 
-De-identified: **no `user_id`, no `receipt_id`.** Written by a background de-identification job from `transactions`. Build the *write path* at launch so the asset accrues from day 1.
+**There is no separate price table at MVP.** Every `transactions` row already *is* a price observation (`product_id` / `description_clean`, `store_id`, `occurred_at`, `unit_price`, `unit`, `currency`). A dedicated `price_history` table would be a ~1:1 duplicate of the biggest table, so:
 
-**`price_history`** — every price observation, **partitioned by month** on `observed_on` (recent partitions hot; old ones compressed — see note below)
+- **Crowd/market price queries = aggregate queries over `transactions`** (grouped by product × store × time), with **k-anonymity enforced** (only return aggregates backed by ≥ K distinct sources) and credit-metered at the API (§7.7). At MVP, the free "*your own* item Y over time" is just a `transactions` query on `(user_id, description_clean)` — no product resolution needed.
+- **`current_prices` (latest price per product × store)** is *not* 1:1 — it collapses to one row per pair. If/when price search needs speed, add it as a **materialized view** over `transactions` (refresh periodically). Not needed at launch.
 
-| Column | Type | Key / Rules | Notes |
-|---|---|---|---|
-| id | BIGSERIAL | part of PK (with `observed_on`) | |
-| product_id | UUID | FK→products | NULL if unresolved |
-| norm_desc | TEXT | | normalized description when product unresolved |
-| store_id | UUID | FK→stores | the *physical shop* |
-| chain_id | UUID | FK→chains | denormalized |
-| region | TEXT | | coarser than store (k-anonymity) |
-| country_code | CHAR(2) | NOT NULL, default 'NO' | |
-| unit_price | NUMERIC(12,2) | NOT NULL | |
-| currency | TEXT | NOT NULL, default 'NOK' | |
-| unit | TEXT | | per stk / kg / l |
-| observed_on | DATE | NOT NULL, partition key | coarsened from `occurred_at` (date only) |
+**Deferred: a de-identified retained `price_history`.** Its *only* justification is GDPR — a copy with **no `user_id`** that (a) survives a user deleting their account and (b) lets the B2B API answer without touching PII. Build it when B2B/retention actually lands (a background job snapshots `transactions` → de-identified, coarsened, k-anonymized rows). **Trade-off of deferring:** until then, a user who deletes their account removes their contribution from the crowd aggregates — acceptable at MVP scale. The asset still accrues from day 1 *inside `transactions`*.
 
-*Indexes:* `(product_id, observed_on DESC)`; `(store_id, observed_on DESC)`.
-
-**`current_prices`** — hot rollup: the *latest* price per (product, store). Tiny, always cached, powers the common "what's it cost now?" lookup.
-
-| Column | Type | Key / Rules | Notes |
-|---|---|---|---|
-| product_id | UUID | FK→products, part of PK | |
-| store_id | UUID | FK→stores, part of PK | |
-| unit_price | NUMERIC(12,2) | NOT NULL | |
-| currency | TEXT | NOT NULL, default 'NOK' | |
-| unit | TEXT | | |
-| observed_on | DATE | NOT NULL | date of the latest observation |
-| updated_at | TIMESTAMPTZ | NOT NULL, default now() | |
-
-*Constraint:* PK `(product_id, store_id)` — one hot row per item×shop, upserted when a newer observation arrives.
-
-**Do we need a separate time-series DB? No — PostgreSQL does this.**
-- **Now:** native **monthly range-partitioning** of `price_history` (built-in, zero extensions) + the tiny hot `current_prices` table for the common lookup. Recent months stay hot; the Price API mostly reads `current_prices` and the newest partitions.
-- **Later (when volume grows):** add the **TimescaleDB** extension (still Postgres) to turn `price_history` into a hypertable with automatic **compression** of old chunks, **retention** policies, and **continuous aggregates** (pre-rolled daily/weekly series). This is exactly the "old data in a less-aggressive cache" idea, done natively. The table is designed so this upgrade is a drop-in — no app changes.
+**Time-series at scale — still just Postgres.** When the retained `price_history` arrives, use native **monthly range-partitioning** (built-in) so recent months stay hot and old ones can be compressed; add the **TimescaleDB** extension later for automatic compression / retention / continuous aggregates (the "old data in a less-aggressive cache" idea). No separate time-series DB needed.
 
 ### 7.4 Timezone handling for `purchase_at`
 
@@ -266,6 +242,19 @@ A paper receipt prints *local* wall-clock time with no zone, but `purchase_at` s
 3. **Fallback** `Europe/Oslo` (Norway-first) if neither is known; flag `needs_review`.
 
 ### 7.5 Support tables
+
+**`refresh_tokens`** — session management (JWT access tokens are short-lived; these rotate/revoke)
+
+| Column | Type | Key / Rules | Notes |
+|---|---|---|---|
+| id | UUID | PK | |
+| user_id | UUID | FK→users, NOT NULL, cascade delete | |
+| token_hash | TEXT | NOT NULL, UNIQUE | store a hash, never the raw token |
+| expires_at | TIMESTAMPTZ | NOT NULL | |
+| revoked_at | TIMESTAMPTZ | | NULL = active |
+| created_at | TIMESTAMPTZ | NOT NULL, default now() | |
+
+*Index:* `(user_id)`.
 
 **`credit_ledger`** — append-only; balance = Σ delta
 
@@ -308,15 +297,27 @@ Because scanning earns spendable credit, dedup/anti-fraud is **layered** (strong
 ### 7.7 Free vs credit-metered (where the credit line falls)
 
 - **Always free — personal domain:** viewing / searching your own `receipts` + `transactions`, your personal analytics, and *your own* price history for *your own* purchases. Looking at your own data is **never** gated.
-- **Credit-metered — crowd domain:** queries against `price_history` / `current_prices` (aggregated market prices from everyone) via the Price API — each query writes a `price_query` debit. Later, B2B access is the *same* surface, metered by money instead of earned credits.
+- **Credit-metered — crowd domain:** aggregate queries over everyone's `transactions` (§7.3) via the Price API — each query writes a `price_query` debit. Later, B2B access is the *same* surface, metered by money instead of earned credits.
+
+### 7.8 Tables considered & deferred
+
+Not built at MVP; documented so we don't rediscover the need later:
+
+- **De-identified `price_history` + `current_prices` view** — when B2B / retention-past-deletion / scale arrives (§7.3).
+- **Generic `jobs` table** — only if job types multiply beyond extraction (MVP: `receipts` is the queue, §7.2).
+- **`consent_events`** — full GDPR consent audit trail (MVP uses columns on `users`).
+- **`data_requests`** — track GDPR export / deletion (DSAR) requests and their status.
+- **`devices`** — push-notification tokens (when notifications ship).
+- **`store_aliases`** — raw store-name → `store_id` resolution (part of the later identity-resolution flow, alongside `raw_text_mappings`).
+- **`receipt_tags` / notes** — user annotations on receipts.
 
 ## 8. GDPR & compliance (hard constraints)
 
 - Receipts can be **Article 9 special-category** data (pharmacy → health, etc.) → treat the corpus as sensitive; use **explicit consent** as the lawful basis.
 - **Self-host the model; keep all data in the EU.** No third-party processor for extraction → no DPA/Schrems exposure. If a cloud fallback is ever used, **EU-only**; **avoid US processors** (EU–US Data Privacy Framework is in acute doubt after a June 2026 US Supreme Court ruling).
-- **Deletion** must cascade to receipt images in object storage **and backups**, not just the `users` row. Note: `price_history` is de-identified at write time, so it is unaffected by erasure.
+- **Deletion** must cascade to the user's `receipts` + `transactions` and their receipt images in object storage **and backups**, not just the `users` row. At MVP, since crowd prices are derived from `transactions`, a deleted user's contribution leaves the aggregates (accepted; §7.3).
 - **Export/portability** (Art. 20) — a full per-user export (transactions + arguably source images) should be one query.
-- **Post-deletion retention** of `price_history` is allowed **only with genuine anonymization** (real k-anonymity/aggregation), documented — most naive "anonymization" is reversible pseudonymization and would be non-compliant.
+- **Post-deletion retention** — once the de-identified `price_history` is introduced (§7.3), retaining it after account deletion is allowed **only with genuine anonymization** (real k-anonymity/aggregation), documented — most naive "anonymization" is reversible pseudonymization and would be non-compliant.
 
 ## 9. Norway specifics
 
@@ -327,7 +328,7 @@ Because scanning earns spendable credit, dedup/anti-fraud is **layered** (strong
 ## 10. Tech stack
 
 - **Backend:** Rust (edition 2024), axum 0.8, tokio, sqlx 0.8 (Postgres + compile-time checks), argon2, jsonwebtoken, `rust-s3`, reqwest.
-- **DB:** PostgreSQL (native monthly partitioning for `price_history`; TimescaleDB later if volume needs it).
+- **DB:** PostgreSQL (crowd prices derived from `transactions`; native partitioning + TimescaleDB later, if a retained price series is introduced).
 - **Client:** Flutter (multi-platform).
 - **Extraction:** self-hosted Qwen3-VL via Ollama → vLLM, on an on-demand EU GPU.
 - **Object storage:** S3-compatible.
@@ -335,7 +336,7 @@ Because scanning earns spendable credit, dedup/anti-fraud is **layered** (strong
 ## 11. Roadmap (phased)
 
 **Launch (MVP)**
-- Auth; capture/upload (photo **and manual digital-PDF upload**); durable extraction queue + self-hosted VLM; validators + confidence gate + `needs_review`; personal archive with filtering (by shop / item / date range) and spend analytics; de-identification job (`transactions` → `price_history` / `current_prices`); credit ledger (earn on scan); Price API (credit-metered) + basic price search; export; GDPR basics (consent, export, delete-with-cascade).
+- Auth (+ `refresh_tokens`); capture/upload (photo **and manual digital-PDF upload**); durable extraction queue (on `receipts`) + self-hosted VLM; validators + confidence gate + `needs_review`; personal archive with filtering (by shop / item / date range) and spend analytics; credit ledger (earn on scan); basic price search as credit-metered aggregate queries over `transactions`; export; GDPR basics (consent, export, delete-with-cascade).
 
 **Later**
 - Email/mailbox digital-receipt ingestion; item-uncertainty **resolution flow** + per-store `raw_text_mappings` (crowd/vote); chain-API opt-in import; "overpaying" comparisons; TimescaleDB for the price series; B2B paid Price API + dashboard; richer product/store identity resolution; international expansion.
@@ -344,7 +345,7 @@ Because scanning earns spendable credit, dedup/anti-fraud is **layered** (strong
 
 1. **Data model finalized (§7).** Implement it: **overwrite** the schema SQL + Rust models/handlers to match (no incremental migrations — no deployment/data yet) and do the workspace restructure.
 2. Norwegian **eval set** (~50–100 receipts) to validate Qwen3-VL 4B vs 8B before locking the model.
-3. Extraction worker (VLM + durable `SKIP LOCKED` queue) + de-identification job (`transactions` → price series).
+3. Extraction worker (VLM + durable `SKIP LOCKED` queue on `receipts`).
 4. Price-API contract (filters, credit metering, and the B2B-access seam).
 5. Client (Flutter) rework to the thin-client shape.
 
@@ -367,6 +368,9 @@ Because scanning earns spendable credit, dedup/anti-fraud is **layered** (strong
 | 2026-07-09 | **Star schema:** central `transactions` fact table (one row / line item) + `users`/`chains`/`stores`/`products`/`categories` dimensions | User's model; the fact table holds FKs to dimensions |
 | 2026-07-09 | Separate `chains` table; `products` identified by barcode (`gtin`, universal number) | User's model |
 | 2026-07-09 | PostgreSQL native **`ENUM`** types for fixed-value columns (not TEXT+CHECK) | User's call |
-| 2026-07-09 | Price index = `price_history` (monthly-partitioned time-series) + `current_prices` hot rollup; **stay on Postgres**, TimescaleDB later | User: hot recent / cold old; no separate time-series DB needed |
+| 2026-07-09 | **No stored price table** at MVP — `transactions` already *is* the price observations; crowd price = k-anon aggregate queries over it | User: a 1:1 duplicate of the fact table is redundant |
+| 2026-07-09 | De-identified retained `price_history` + `current_prices` view **deferred** to when B2B / retention / scale needs it | Consumer-first; avoid premature duplication (accept: deleted-account signal is lost until then) |
 | 2026-07-09 | `purchase_at` = universal `TIMESTAMPTZ`; timezone from store address/geo → else client device tz (VPN-safe, never IP) | User decision on time/VPN |
-| 2026-07-09 | Build `price_history` write path at launch; layered anti-fraud (phash + signatures + arithmetic gate + idempotent ledger) | Accrue the B2B asset from day 1; credit has value so dedup must beat a hash |
+| 2026-07-09 | `receipts` table **is** the extraction queue (`SKIP LOCKED` + retry columns); generic `jobs` table only if job types multiply | Simplest for one job type |
+| 2026-07-09 | Add `refresh_tokens` for real session management | JWT access tokens alone can't rotate/revoke |
+| 2026-07-09 | Layered anti-fraud (phash + signatures + arithmetic gate + idempotent ledger), stronger than a hash | Credit has spendable value; asset accrues in `transactions` |
