@@ -97,6 +97,7 @@ Flutter client ──HTTPS──> axum backend (modular monolith) ──> Postgr
 | `fraud_status` | ok, suspected, confirmed, dismissed |
 | `ledger_reason` | scan_reward, price_query, signup_bonus, referral, adjustment, reversal |
 | `mapping_status` | proposed, approved, rejected |
+| `price_type` | shelf, promo, member, coupon, net_only |
 
 ### 7.1 Dimension tables (small, shared)
 
@@ -214,8 +215,11 @@ The `receipts` table **is** the extraction queue — the worker polls `WHERE ext
 | item_type | `item_type` | NOT NULL, default 'product' | handles `pant` / `rabatt` lines |
 | quantity | NUMERIC(12,3) | default 1 | supports weight (kg) |
 | unit | TEXT | | 'stk', 'kg', 'l' |
-| unit_price | NUMERIC(12,2) | | |
-| line_total | NUMERIC(12,2) | | |
+| shelf_unit_price | NUMERIC(12,2) | | shelf/list price per unit *before* discount (when the receipt shows it) |
+| unit_price | NUMERIC(12,2) | | **net** price per unit actually paid |
+| discount_amount | NUMERIC(12,2) | | line discount = (shelf − net) × qty; 0 / NULL if none |
+| line_total | NUMERIC(12,2) | | **net** amount paid for the line |
+| price_type | `price_type` | NOT NULL, default 'net_only' | shelf / promo / member / coupon / net_only (§7.3) |
 | mva_rate | NUMERIC(5,2) | | 25.00 / 15.00 / 12.00 |
 | confidence | REAL | | |
 | needs_review | BOOLEAN | NOT NULL, default false | |
@@ -229,6 +233,14 @@ The `receipts` table **is** the extraction queue — the worker polls `WHERE ext
 
 - **Crowd/market price queries = aggregate queries over `transactions`** (grouped by product × store × time), with **k-anonymity enforced** (only return aggregates backed by ≥ K distinct sources) and credit-metered at the API (§7.7). At MVP, the free "*your own* item Y over time" is just a `transactions` query on `(user_id, description_clean)` — no product resolution needed.
 - **`current_prices` (latest price per product × store)** is *not* 1:1 — it collapses to one row per pair. If/when price search needs speed, add it as a **materialized view** over `transactions` (refresh periodically). Not needed at launch.
+
+**Price semantics — one item can have several prices at once.** Two shoppers can pay different amounts for the same item at the same store+time (member price, coupon, promo), so a price is not a single number. We model it per line from *what the receipt shows*:
+- `unit_price` / `line_total` = the **net** the user actually paid — always captured; this is what the personal archive uses.
+- `shelf_unit_price` + `discount_amount` = the **store-set** price and the reduction, *when the receipt itemizes them* (a base line + a `Rabatt`/`Trumf` line).
+- `price_type` classifies the observation: `shelf` / `promo` are **store-set** (user-independent, comparable across shoppers); `member` / `coupon` are **personal**; `net_only` = we only know what was paid.
+- Line-attributable discounts fold onto the product row (shelf + discount); basket-level discounts stay as standalone `item_type = 'discount'` transactions.
+
+For the crowd **price index**, compare **store-set prices** (`shelf` / `promo`) for apples-to-apples; surface `member` prices as a separate tier; never mix a coupon price into the shelf-price series. **We can only model what's on the receipt** — a bare net total is stored tagged `net_only`. This stays general across all shops worldwide while representing the richer cases when the data is there. **Out of per-item scope:** chain loyalty rebates that pay 1–3 % back on the whole basket to a membership account (Coop *kjøpeutbytte*, Trumf) — a basket-level perk paid later, not a per-item price (optionally a receipt-level note if we ever want effective-cost analytics).
 
 **Deferred: a de-identified retained `price_history`.** Its *only* justification is GDPR — a copy with **no `user_id`** that (a) survives a user deleting their account and (b) lets the B2B API answer without touching PII. Build it when B2B/retention actually lands (a background job snapshots `transactions` → de-identified, coarsened, k-anonymized rows). **Trade-off of deferring:** until then, a user who deletes their account removes their contribution from the crowd aggregates — acceptable at MVP scale. The asset still accrues from day 1 *inside `transactions`*.
 
@@ -321,7 +333,7 @@ Not built at MVP; documented so we don't rediscover the need later:
 
 ## 9. Norway specifics
 
-- **Formats:** NOK comma decimals (`49,90`), space/period thousands, `DD.MM.YYYY` dates, MVA breakdown table (rates 25 % / 15 % / 12 %, **prices shown gross**), `pant` (deposit) and `Rabatt`/`Trumf` lines, `Totalt`/`Å betale` labels, `NO#########MVA` org-number as store id.
+- **Formats:** NOK comma decimals (`49,90`), space/period thousands, `DD.MM.YYYY` dates, MVA breakdown table (rates 25 % / 15 % / 12 %, **prices shown gross**), `pant` (deposit) and `Rabatt`/`Trumf` lines, `Totalt`/`Å betale` labels, `NO#########MVA` org-number as store id. Member/`Trumf` prices are *personal*, not shelf prices (§7.3).
 - **Chain digital receipts** (Rema 1000 Æ, Coop Medlem, Trumf → Kiwi/Meny) expose perfect structured line items covering ~97 % of grocery — but via **unofficial, reverse-engineered, ToS-gray** APIs. **Opt-in Phase-3 only, never load-bearing.**
 - **EHF/Peppol** is B2B/B2G e-invoicing, **not** consumer receipts — out of scope for ingestion.
 
@@ -374,3 +386,5 @@ Not built at MVP; documented so we don't rediscover the need later:
 | 2026-07-09 | `receipts` table **is** the extraction queue (`SKIP LOCKED` + retry columns); generic `jobs` table only if job types multiply | Simplest for one job type |
 | 2026-07-09 | Add `refresh_tokens` for real session management | JWT access tokens alone can't rotate/revoke |
 | 2026-07-09 | Layered anti-fraud (phash + signatures + arithmetic gate + idempotent ledger), stronger than a hash | Credit has spendable value; asset accrues in `transactions` |
+| 2026-07-09 | Price modeled per line as **net paid** + optional **shelf price / discount** + a `price_type` tag (shelf/promo/member/coupon/net_only); index compares store-set prices | Same item has several prices at once (member/coupon/promo); model receipt-visible cases, degrade to net_only |
+| 2026-07-09 | Chain loyalty rebates (1–3 % basket cashback) out of per-item price scope | Basket-level perk paid later, not a per-item price |
