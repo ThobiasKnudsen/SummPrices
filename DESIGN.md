@@ -34,7 +34,7 @@
 2. **Two data domains, separated from day one** (§7):
    - **Operational / PII** — users, receipts, images, their line-item transactions. Tied to identity.
    - **Anonymized crowd/price data** — derived from `transactions` (aggregated, **no user identity**). Materialized into a retained de-identified store only when B2B / retention needs it (§7.3).
-3. **Thin client.** Flutter app = capture + upload + display + API calls. **No meaningful processing on the client** — Postgres, the backend, and the extraction service do the work.
+3. **Thin client.** The web app (React + TS SPA) = capture + upload + display + API calls. **No meaningful processing on the client** — Postgres, the backend, and the extraction service do the work.
 4. **Extraction behind a `ReceiptExtractor` trait** — the model/provider is a swappable implementation detail (§6).
 5. **GDPR-first** (§8). Self-hosting the model and keeping all data in the EU is a deliberate compliance + product advantage.
 6. **Async by default.** Receipt extraction runs off the request path via a durable job queue.
@@ -42,7 +42,7 @@
 ## 5. System architecture
 
 ```
-Flutter client ──HTTPS──> axum backend (modular monolith) ──> PostgreSQL
+React web app  ──HTTPS──> axum backend (modular monolith) ──> PostgreSQL
    (thin: capture,             │  ├─ identity/auth               │  (operational/PII
     upload, display,           │  ├─ capture/ingest               │   + reference catalog
     API calls)                 │  ├─ extraction (trait)           │   + anonymized
@@ -56,7 +56,7 @@ Flutter client ──HTTPS──> axum backend (modular monolith) ──> Postgr
 ```
 
 - **Backend:** Rust, axum 0.8, sqlx 0.8 (Postgres, compile-time-checked), argon2 + JWT auth, `rust-s3` for object storage.
-- **Client:** one Flutter app (multi-platform).
+- **Client:** React + TypeScript SPA (Vite, Tailwind). *(Flutter web MVP was replaced; native mobile revisited later.)*
 - **Object storage:** S3-compatible; receipt images keyed per user; presigned URLs for display.
 
 ## 6. Receipt extraction pipeline
@@ -342,7 +342,7 @@ Not built at MVP; documented so we don't rediscover the need later:
 
 - **Backend:** Rust (edition 2024), axum 0.8, tokio, sqlx 0.8 (Postgres + compile-time checks), argon2, jsonwebtoken, `rust-s3`, reqwest.
 - **DB:** PostgreSQL (crowd prices derived from `transactions`; native partitioning + TimescaleDB later, if a retained price series is introduced).
-- **Client:** Flutter (multi-platform).
+- **Client:** React + TypeScript SPA in `web/` (Vite + Tailwind + React Router + TanStack Query + Recharts).
 - **Extraction:** self-hosted Qwen3-VL via Ollama → vLLM, on an on-demand EU GPU.
 - **Object storage:** S3-compatible.
 
@@ -360,7 +360,7 @@ Not built at MVP; documented so we don't rediscover the need later:
 2. Norwegian **eval set** (~50–100 receipts) to validate Qwen3-VL 4B vs 8B before locking the model.
 3. Extraction worker (VLM + durable `SKIP LOCKED` queue on `receipts`).
 4. Price-API contract (filters, credit metering, and the B2B-access seam).
-5. Client (Flutter) rework to the thin-client shape.
+5. Web client = React + TS SPA in `web/` (built); the Flutter `client/` was removed.
 
 ## 13. Decision log
 
@@ -392,6 +392,8 @@ Not built at MVP; documented so we don't rediscover the need later:
 | 2026-07-09 | **Progressive KYC** — basic scanning/earning stays open; identity verification gates only high-value contributions / cash-out / elevated trust (provider-based, store status only, never ID docs) | Corruption-resistance without killing the funnel or holding identity data |
 | 2026-07-09 | `trust_score` = earned from contributions proving true over time (corroboration); crowdsourced enrichment + bounty economy captured as vision (§14) | Hard-to-corrupt data moat; phased, post-MVP |
 | 2026-07-09 | Trust engine = weighted truth discovery (Dawid–Skene-style batch EM); **KYC = high prior weight, not an oracle**; reward = value-of-information; output = value + confidence | User's KYC-weighting idea, with guardrails against KYC-as-oracle and minority-suppression |
+| 2026-07-10 | MVP backend built + verified end-to-end (star schema, `ReceiptExtractor` trait mock/hosted, ingest harness, credits) | Commit 029ec07; runs on local Postgres + MinIO |
+| 2026-07-10 | **Web frontend = React + TypeScript SPA** (Vite + Tailwind + TanStack Query + Recharts); Flutter `client/` **removed** | Team prefers TS; cleaner web DX. Supersedes the earlier Flutter-web choice (§5/§10). Native mobile revisited later |
 
 ## 14. Future vision — crowdsourced item enrichment & reputation
 

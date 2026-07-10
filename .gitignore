@@ -6,13 +6,9 @@ backend/.env
 backend/dev_receipts/*
 !backend/dev_receipts/.gitkeep
 
-# Flutter
-client/.dart_tool/
-client/.packages
-client/build/
-client/.flutter-plugins
-client/.flutter-plugins-dependencies
-client/pubspec.lock
+# Web (React / Vite) — see web/.gitignore for the rest
+web/node_modules/
+web/dist/
 *.iml
 
 # IDE
