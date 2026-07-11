@@ -1,10 +1,11 @@
 import { useState } from 'react';
-import { keepPreviousData, useQuery } from '@tanstack/react-query';
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
-import { listReceipts } from '../api/receipts';
+import { listReceipts, reprocessAllReceipts } from '../api/receipts';
 import type { ReceiptFilters } from '../api/receipts';
 import type { ExtractionStatus } from '../api/types';
 import { ReceiptCard } from '../components/ReceiptCard';
+import { ModelPicker, useModelChoice } from '../components/ModelPicker';
 import { Spinner } from '../components/Spinner';
 import { EmptyState } from '../components/EmptyState';
 import { ApiError } from '../lib/apiClient';
@@ -36,10 +37,29 @@ export function ReceiptsPage() {
     per_page: 60,
   };
 
+  const queryClient = useQueryClient();
+  const { model, setModel, options, current } = useModelChoice();
+
   const { data, isLoading, isError, error, isFetching } = useQuery({
     queryKey: ['receipts', filters],
     queryFn: () => listReceipts(filters),
     placeholderData: keepPreviousData,
+    // While any receipt is (re)scanning, poll so the list updates as each finishes.
+    refetchInterval: (query) => {
+      const list = query.state.data?.receipts ?? [];
+      return list.some((r) => ['pending', 'queued', 'processing'].includes(r.extraction_status))
+        ? 3000
+        : false;
+    },
+  });
+
+  const rescanAll = useMutation({
+    mutationFn: () => reprocessAllReceipts(model),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['receipts'] });
+      queryClient.invalidateQueries({ queryKey: ['transactions'] });
+      queryClient.invalidateQueries({ queryKey: ['analytics'] });
+    },
   });
 
   const receipts = data?.receipts ?? [];
@@ -60,6 +80,36 @@ export function ReceiptsPage() {
         >
           Upload receipt
         </Link>
+      </div>
+
+      <div className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-dashed border-slate-300 bg-slate-50 px-4 py-3">
+        <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Debug</span>
+        <ModelPicker
+          value={model}
+          options={options}
+          current={current}
+          onChange={setModel}
+          disabled={rescanAll.isPending}
+        />
+        <button
+          type="button"
+          onClick={() => rescanAll.mutate()}
+          disabled={rescanAll.isPending}
+          className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 transition hover:bg-slate-100 disabled:opacity-60"
+          title="Re-run extraction on every receipt with the selected model"
+        >
+          {rescanAll.isPending ? 'Queuing…' : 'Rescan all'}
+        </button>
+        {rescanAll.isSuccess ? (
+          <span className="text-xs text-emerald-600">
+            Queued {rescanAll.data.queued} receipt(s) — they’ll refresh as each finishes.
+          </span>
+        ) : null}
+        {rescanAll.isError ? (
+          <span className="text-xs text-red-600">
+            {rescanAll.error instanceof ApiError ? rescanAll.error.message : 'Failed to queue rescan.'}
+          </span>
+        ) : null}
       </div>
 
       <div className="mb-6 grid grid-cols-1 gap-3 rounded-xl border border-slate-200 bg-white p-4 sm:grid-cols-2 lg:grid-cols-4">

@@ -33,6 +33,8 @@ pub enum ItemType {
     Discount,
     Fee,
     Rounding,
+    /// A cashier void/reversal of a previously-scanned line (e.g. Norwegian "KORR.").
+    Correction,
     Unknown,
 }
 

@@ -34,6 +34,10 @@ pub struct ExtractedLineItem {
 pub struct ExtractedReceipt {
     pub store_name_raw: Option<String>,
     pub org_no: Option<String>,
+    pub store_address: Option<String>,
+    pub store_city: Option<String>,
+    pub store_postal_code: Option<String>,
+    pub store_country_code: Option<String>,
     pub receipt_number: Option<String>,
     pub payment_method: Option<String>, // card | cash | vipps | ... (never card digits)
     pub purchase_at: Option<DateTime<Utc>>,
@@ -42,9 +46,10 @@ pub struct ExtractedReceipt {
     pub mva_total: Option<Decimal>,
     pub total: Option<Decimal>,
     pub line_items: Vec<ExtractedLineItem>,
-    pub confidence: Option<f32>,
+    pub confidence: Option<f32>, // model self-reported completeness/correctness, 0..1
+    pub notes: Option<String>,   // model-reported problems (blurry, cropped, unreadable lines)
     pub engine: String,
-    pub raw: serde_json::Value, // the model's receipt JSON (store address, mva_lines, payment, … live here)
+    pub raw: serde_json::Value, // the model's receipt JSON (mva_lines, payment, … also live here)
 }
 
 #[async_trait::async_trait]
@@ -63,6 +68,16 @@ pub fn build_from_env(config: &Config) -> Arc<dyn ReceiptExtractor> {
         )),
         _ => Arc::new(mock::MockExtractor::new()),
     }
+}
+
+/// Build a hosted extractor for a specific model, reusing the configured endpoint + key.
+/// Used by the debug model picker to rescan a receipt with an on-the-fly model choice.
+pub fn build_hosted_model(config: &Config, model: &str) -> Arc<dyn ReceiptExtractor> {
+    Arc::new(hosted_vlm::HostedVlmExtractor::new(
+        &config.vlm_url,
+        model,
+        config.vlm_api_key.clone(),
+    ))
 }
 
 /// f64 -> Decimal at 2 decimal places (money).

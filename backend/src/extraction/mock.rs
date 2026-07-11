@@ -66,6 +66,10 @@ impl ReceiptExtractor for MockExtractor {
         Ok(ExtractedReceipt {
             store_name_raw: Some("KIWI Storgata".to_string()),
             org_no: Some("NO123456789MVA".to_string()),
+            store_address: Some("Storgata 1".to_string()),
+            store_city: Some("Oslo".to_string()),
+            store_postal_code: Some("0155".to_string()),
+            store_country_code: Some("NO".to_string()),
             receipt_number: Some("MOCK-0001".to_string()),
             payment_method: Some("card".to_string()),
             purchase_at: Utc.with_ymd_and_hms(2026, 1, 15, 13, 30, 0).single(),
@@ -75,6 +79,7 @@ impl ReceiptExtractor for MockExtractor {
             total: Some(total),
             line_items,
             confidence: Some(1.0),
+            notes: None,
             engine: self.engine.clone(),
             raw: serde_json::json!({ "mock": true }),
         })

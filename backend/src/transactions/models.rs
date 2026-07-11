@@ -18,6 +18,7 @@ pub struct TransactionWithContext {
     pub line_total: Option<Decimal>,
     pub mva_rate: Option<Decimal>,
     pub store_name_raw: Option<String>,
+    pub currency: String,
     pub purchase_at: Option<DateTime<Utc>>,
 }
 

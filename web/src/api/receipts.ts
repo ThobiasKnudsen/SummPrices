@@ -1,9 +1,11 @@
 import { api } from '../lib/apiClient';
 import type {
+  DebugModels,
   ReceiptDetail,
   ReceiptHeader,
   ReceiptListResponse,
   ReceiptStatus,
+  ReprocessAllResponse,
 } from './types';
 
 export interface ReceiptFilters {
@@ -47,4 +49,19 @@ export function updateReceipt(id: string, body: UpdateReceiptBody): Promise<Rece
 
 export function deleteReceipt(id: string): Promise<void> {
   return api.delete<void>(`/api/receipts/${id}`);
+}
+
+/** Re-run extraction on an already-uploaded receipt, optionally with a specific model. */
+export function reprocessReceipt(id: string, model?: string): Promise<void> {
+  return api.post<void>(`/api/receipts/${id}/reprocess`, { model: model || undefined });
+}
+
+/** Debug: re-extract all of the current user's receipts, optionally with a specific model. */
+export function reprocessAllReceipts(model?: string): Promise<ReprocessAllResponse> {
+  return api.post<ReprocessAllResponse>('/api/debug/reprocess-all', { model: model || undefined });
+}
+
+/** Debug: the selectable extraction models for the in-app model picker. */
+export function getDebugModels(): Promise<DebugModels> {
+  return api.get<DebugModels>('/api/debug/models');
 }

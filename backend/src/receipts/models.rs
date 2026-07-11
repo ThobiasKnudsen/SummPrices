@@ -10,6 +10,10 @@ pub struct Receipt {
     pub id: Uuid,
     pub user_id: Uuid,
     pub store_name_raw: Option<String>,
+    pub store_address: Option<String>,
+    pub store_city: Option<String>,
+    pub store_postal_code: Option<String>,
+    pub store_country_code: Option<String>,
     pub purchase_at: Option<DateTime<Utc>>,
     pub subtotal: Option<Decimal>,
     pub mva_total: Option<Decimal>,
@@ -18,6 +22,7 @@ pub struct Receipt {
     pub extraction_status: ExtractionStatus,
     pub extraction_conf: Option<f32>,
     pub needs_review: bool,
+    pub review_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(skip)]
@@ -32,6 +37,8 @@ pub struct ReceiptSummary {
     pub total: Option<Decimal>,
     pub currency: String,
     pub extraction_status: ExtractionStatus,
+    pub extraction_conf: Option<f32>,
+    pub needs_review: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -84,4 +91,22 @@ pub struct UpdateReceiptRequest {
 pub struct ExtractionStatusResponse {
     pub extraction_status: ExtractionStatus,
     pub extraction_conf: Option<f32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ReprocessRequest {
+    /// Optional model override for this scan only (debug model picker).
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReprocessAllResponse {
+    pub queued: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DebugModelsResponse {
+    pub current: String,
+    pub options: Vec<String>,
 }

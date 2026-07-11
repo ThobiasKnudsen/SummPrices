@@ -1,10 +1,11 @@
 //! Shared persistence seam used by BOTH the HTTP upload handler and the dev ingest harness.
 use std::sync::Arc;
 
+use rust_decimal::Decimal;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::enums::{ExtractionStatus, ReceiptSource};
+use crate::enums::{ExtractionStatus, ItemType, ReceiptSource};
 use crate::errors::AppError;
 use crate::extraction::{ExtractedReceipt, ReceiptExtractor};
 
@@ -56,8 +57,64 @@ pub async fn set_asset_key(pool: &PgPool, receipt_id: Uuid, key: &str) -> Result
     Ok(())
 }
 
-fn compute_needs_review(ex: &ExtractedReceipt) -> bool {
-    ex.line_items.is_empty() || ex.confidence.is_some_and(|c| c < 0.5)
+/// Reconcile an extraction and decide whether a human should review it. Returns
+/// `(needs_review, human-readable reason)`. Beyond empty/low-confidence catches, this
+/// sums the (signed) line totals and compares them to the printed total — the check
+/// that catches missing, duplicated, or misread items.
+pub fn compute_review(ex: &ExtractedReceipt) -> (bool, Option<String>) {
+    if ex.line_items.is_empty() {
+        return (
+            true,
+            Some("No line items could be read from this receipt.".to_string()),
+        );
+    }
+
+    let mut reasons: Vec<String> = Vec::new();
+
+    if let Some(c) = ex.confidence {
+        if c < 0.5 {
+            reasons.push(format!("Low extractor confidence ({:.0}%).", c * 100.0));
+        }
+    }
+    if let Some(note) = ex.notes.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        reasons.push(format!("Extractor note: {note}"));
+    }
+
+    // Priced items (products/deposits/fees) should each carry a line total.
+    let missing_price = ex
+        .line_items
+        .iter()
+        .filter(|li| {
+            matches!(
+                li.item_type,
+                ItemType::Product | ItemType::Deposit | ItemType::Fee
+            ) && li.line_total.is_none()
+        })
+        .count();
+    if missing_price > 0 {
+        reasons.push(format!("{missing_price} item(s) have no price."));
+    }
+
+    // Arithmetic reconciliation: signed line totals must equal the printed total,
+    // allowing half a currency unit of rounding slack (øreavrunding / Rappen rounding).
+    match ex.total {
+        Some(total) => {
+            let sum: Decimal = ex.line_items.iter().filter_map(|li| li.line_total).sum();
+            let diff = (sum - total).abs();
+            if diff > Decimal::new(55, 2) {
+                reasons.push(format!(
+                    "Items sum to {sum} but the receipt total is {total} (off by {diff}) — an item may be missing or misread."
+                ));
+            }
+        }
+        None => reasons.push("No total could be read from this receipt.".to_string()),
+    }
+
+    if reasons.is_empty() {
+        (false, None)
+    } else {
+        (true, Some(reasons.join(" ")))
+    }
 }
 
 /// Persist an extraction result. Reparse-idempotent: deletes existing line items first,
@@ -68,32 +125,50 @@ pub async fn persist_extraction(
     user_id: Uuid,
     ex: &ExtractedReceipt,
 ) -> Result<(), AppError> {
-    let needs_review = compute_needs_review(ex);
+    let (needs_review, review_reason) = compute_review(ex);
     let status = if needs_review {
         ExtractionStatus::NeedsReview
     } else {
         ExtractionStatus::Done
     };
 
+    // Single transaction guarded by a per-receipt row lock: two concurrent extractions
+    // (e.g. a rescan racing the original upload) can't interleave DELETE/INSERT and
+    // duplicate the line items. The scan credit is awarded in the same transaction.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM receipts WHERE id = $1 FOR UPDATE")
+        .bind(receipt_id)
+        .execute(&mut *tx)
+        .await?;
+
     sqlx::query(
         "UPDATE receipts SET
             store_name_raw = $2,
-            purchase_at = $3,
-            currency = $4,
-            subtotal = $5,
-            mva_total = $6,
-            total = $7,
-            raw_extraction = $8,
-            extraction_engine = $9,
-            extraction_conf = $10,
-            extraction_status = $11,
-            needs_review = $12,
-            receipt_number = $13,
+            store_address = $3,
+            store_city = $4,
+            store_postal_code = $5,
+            store_country_code = $6,
+            purchase_at = $7,
+            currency = $8,
+            subtotal = $9,
+            mva_total = $10,
+            total = $11,
+            raw_extraction = $12,
+            extraction_engine = $13,
+            extraction_conf = $14,
+            extraction_status = $15,
+            needs_review = $16,
+            review_reason = $17,
+            receipt_number = $18,
             updated_at = now()
          WHERE id = $1",
     )
     .bind(receipt_id)
     .bind(&ex.store_name_raw)
+    .bind(&ex.store_address)
+    .bind(&ex.store_city)
+    .bind(&ex.store_postal_code)
+    .bind(&ex.store_country_code)
     .bind(ex.purchase_at)
     .bind(&ex.currency)
     .bind(ex.subtotal)
@@ -104,13 +179,14 @@ pub async fn persist_extraction(
     .bind(ex.confidence)
     .bind(status)
     .bind(needs_review)
+    .bind(&review_reason)
     .bind(&ex.receipt_number)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     sqlx::query("DELETE FROM transactions WHERE receipt_id = $1")
         .bind(receipt_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
     for (i, li) in ex.line_items.iter().enumerate() {
@@ -137,16 +213,12 @@ pub async fn persist_extraction(
         .bind(li.line_total)
         .bind(li.price_type)
         .bind(li.mva_rate)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
 
-    award_scan_credit(pool, user_id, receipt_id).await?;
-    Ok(())
-}
-
-async fn award_scan_credit(pool: &PgPool, user_id: Uuid, receipt_id: Uuid) -> Result<(), AppError> {
-    let mut tx = pool.begin().await?;
+    // Scan reward (idempotent via the credit_ledger unique index): the first successful
+    // parse of a receipt credits the user; a reparse/rescan never double-credits.
     let inserted: Option<(i64,)> = sqlx::query_as(
         "INSERT INTO credit_ledger (user_id, delta, reason, ref_type, ref_id, balance_after)
          SELECT $1, $2, 'scan_reward', 'receipt', $3, u.credit_balance + $2

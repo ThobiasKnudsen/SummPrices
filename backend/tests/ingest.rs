@@ -134,4 +134,37 @@ async fn ingest_dev_receipts() {
     }
 
     println!("ingest: {new} new, {reparsed} reparsed, {skipped} skipped (commit {GIT_COMMIT})");
+
+    // Show what the current parser produced for every dev-user receipt so the run is
+    // legible without a DB client.
+    let rows: Vec<(
+        Option<String>,
+        String,
+        Option<String>,
+        String,
+        bool,
+        Option<String>,
+        i64,
+    )> = sqlx::query_as(
+        "SELECT r.store_name_raw, r.currency, r.total::text, r.extraction_status::text,
+                r.needs_review, r.review_reason,
+                (SELECT count(*) FROM transactions t WHERE t.receipt_id = r.id)
+         FROM receipts r WHERE r.user_id = $1
+         ORDER BY r.created_at",
+    )
+    .bind(pipeline::DEV_USER_ID)
+    .fetch_all(&pool)
+    .await
+    .expect("summary query");
+
+    println!("\n--- dev-user receipts after ingest ---");
+    for (store, currency, total, status, needs_review, reason, items) in rows {
+        let store: String = store.unwrap_or_else(|| "—".into()).chars().take(26).collect();
+        let total = total.unwrap_or_else(|| "—".into());
+        let flag = if needs_review { " ⚠ needs_review" } else { "" };
+        println!("  {store:<26} {items:>3} items  {total:>9} {currency}  [{status}]{flag}");
+        if let Some(reason) = reason {
+            println!("       ↳ {reason}");
+        }
+    }
 }

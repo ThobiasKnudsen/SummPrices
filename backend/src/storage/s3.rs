@@ -83,6 +83,22 @@ impl Storage {
         Ok(())
     }
 
+    /// Download the raw bytes of a stored object (used to re-extract on rescan).
+    pub async fn get(&self, key: &str) -> Result<Vec<u8>, AppError> {
+        let resp = self
+            .bucket
+            .get_object(key)
+            .await
+            .map_err(|e| AppError::Internal(format!("S3 get failed: {e}")))?;
+        if resp.status_code() != 200 {
+            return Err(AppError::Internal(format!(
+                "S3 get {key} returned {}",
+                resp.status_code()
+            )));
+        }
+        Ok(resp.bytes().to_vec())
+    }
+
     pub async fn get_presigned_url(&self, key: &str, expiry_secs: u32) -> Result<String, AppError> {
         self.bucket
             .presign_get(key, expiry_secs, None)

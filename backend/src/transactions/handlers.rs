@@ -25,7 +25,7 @@ pub async fn list(
     let transactions = sqlx::query_as::<_, TransactionWithContext>(&format!(
         "SELECT t.id, t.receipt_id, t.description_raw, t.description_clean, t.item_type,
                 t.quantity, t.unit, t.unit_price, t.line_total, t.mva_rate,
-                r.store_name_raw, r.purchase_at
+                r.store_name_raw, r.currency, r.purchase_at
          FROM transactions t
          JOIN receipts r ON r.id = t.receipt_id
          WHERE t.user_id = $1 {FILTERS}

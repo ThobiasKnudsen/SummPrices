@@ -35,6 +35,7 @@ async fn main() {
         pool,
         storage,
         extractor,
+        config,
     };
 
     let app = Router::new()
@@ -50,6 +51,16 @@ async fn main() {
         .route("/api/receipts/{id}", put(receipts::handlers::update))
         .route("/api/receipts/{id}", delete(receipts::handlers::delete))
         .route("/api/receipts/{id}/status", get(receipts::handlers::status))
+        .route(
+            "/api/receipts/{id}/reprocess",
+            post(receipts::handlers::reprocess),
+        )
+        // Debug: selectable extraction models + bulk rescan for the in-app model picker.
+        .route("/api/debug/models", get(receipts::handlers::debug_models))
+        .route(
+            "/api/debug/reprocess-all",
+            post(receipts::handlers::reprocess_all),
+        )
         // Transactions
         .route("/api/transactions", get(transactions::handlers::list))
         .route("/api/transactions/{id}", put(transactions::handlers::update))

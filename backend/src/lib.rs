@@ -25,6 +25,13 @@ pub struct AppState {
     pub pool: sqlx::PgPool,
     pub storage: Storage,
     pub extractor: Arc<dyn ReceiptExtractor>,
+    pub config: crate::config::Config,
+}
+
+impl axum::extract::FromRef<AppState> for crate::config::Config {
+    fn from_ref(state: &AppState) -> Self {
+        state.config.clone()
+    }
 }
 
 impl axum::extract::FromRef<AppState> for sqlx::PgPool {

@@ -2,6 +2,7 @@ import { Link } from 'react-router-dom';
 import type { ReceiptSummary } from '../api/types';
 import { formatDate, formatMoney } from '../lib/format';
 import { StatusBadge } from './StatusBadge';
+import { ConfidencePill } from './ConfidencePill';
 
 export function ReceiptCard({ receipt }: { receipt: ReceiptSummary }) {
   return (
@@ -18,7 +19,10 @@ export function ReceiptCard({ receipt }: { receipt: ReceiptSummary }) {
             {formatDate(receipt.purchase_at ?? receipt.created_at)}
           </p>
         </div>
-        <StatusBadge status={receipt.extraction_status} />
+        <div className="flex flex-col items-end gap-1.5">
+          <StatusBadge status={receipt.extraction_status} />
+          <ConfidencePill value={receipt.extraction_conf} />
+        </div>
       </div>
       <div className="mt-3 text-lg font-semibold text-slate-900">
         {formatMoney(receipt.total, receipt.currency)}

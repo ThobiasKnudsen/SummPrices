@@ -76,7 +76,7 @@ export function ItemsPage() {
                   <td className="px-3 py-2.5 text-slate-600">{tx.store_name_raw ?? '—'}</td>
                   <td className="px-3 py-2.5 text-slate-600">{formatDate(tx.purchase_at)}</td>
                   <td className="px-5 py-2.5 text-right font-medium text-slate-800">
-                    {formatMoney(tx.line_total)}
+                    {formatMoney(tx.line_total, tx.currency)}
                   </td>
                 </tr>
               ))}

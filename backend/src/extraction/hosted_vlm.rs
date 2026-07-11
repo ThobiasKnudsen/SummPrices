@@ -33,7 +33,7 @@ const PROMPT: &str = r#"You are a receipt-parsing engine. Extract the receipt in
 {
   "store": { "name": string|null, "org_no": string|null, "address": string|null, "city": string|null, "postal_code": string|null, "country_code": string|null },
   "purchase_at": string|null,          // the printed local date/time, e.g. "2026-01-15T13:30" or "2026-01-15 13:30"
-  "currency": string,                  // e.g. "NOK"
+  "currency": string,                  // the currency ACTUALLY printed: "NOK","SEK","DKK","EUR","CHF",...
   "receipt_number": string|null,       // bong/receipt number if printed
   "payment": { "method": string|null },// "card" | "cash" | "vipps" | ... (NEVER card numbers)
   "subtotal": number|null,
@@ -48,19 +48,47 @@ const PROMPT: &str = r#"You are a receipt-parsing engine. Extract the receipt in
       "shelf_unit_price": number|null, // price before discount, if shown
       "unit_price": number|null,       // net price actually paid per unit
       "discount_amount": number|null,
-      "line_total": number|null,       // net amount paid for the line
-      "item_type": "product"|"deposit"|"discount"|"fee"|"rounding"|"unknown",
+      "line_total": number|null,       // signed amount for the line (see rules)
+      "item_type": "product"|"deposit"|"discount"|"fee"|"rounding"|"correction"|"unknown",
       "price_type": "shelf"|"promo"|"member"|"coupon"|"net_only",
       "mva_rate": number|null          // e.g. 25, 15, 12
     }
-  ]
+  ],
+  "confidence": number,                // 0..1: how sure you are the extraction is COMPLETE and CORRECT
+  "notes": string|null                 // brief note on any problem (blurry, cropped, unreadable lines) or null
 }
-Norwegian receipts: comma is the decimal separator (49,90 = 49.90); "pant" lines are deposits (item_type "deposit"); "Rabatt"/"Trumf" lines are discounts (item_type "discount"). Output only the JSON object."#;
+Rules:
+- Extract EVERY printed line item. Do not skip, merge, or summarize lines.
+- ROW ALIGNMENT: each item's amount is printed on the SAME horizontal row as its description.
+  Read the receipt row by row and pair each description with the number on its OWN line — never
+  borrow the price from the row above or below it. Amounts usually line up in a right-hand column.
+- PER-LINE CHECK: when both quantity and unit_price are present, quantity × unit_price must equal
+  line_total for that row. If it doesn't, you have grabbed the wrong number — re-read that row.
+- Store name: transcribe the header EXACTLY as printed. Never guess or substitute a different
+  company; if the name is unreadable, set store.name to null rather than inventing one.
+- Numbers: a comma is the decimal separator (49,90 = 49.90). Never invent digits you cannot read.
+- Currency: use what is printed (CHF for Swiss receipts, EUR, SEK, DKK, ...). Do NOT default to NOK.
+- Store: fill address / city / postal_code / country_code from the header when present.
+- Signs: products, deposits and fees are POSITIVE line_total; discounts, corrections and rounding are NEGATIVE line_total.
+  "pant" = deposit; "Rabatt"/"Trumf"/"Mixrabatt" = discount; "øreavrunding"/"avrunding"/rounding = rounding.
+- Corrections/voids: lines like "KORR", "KORR. TID.", "KORR. SIST", "Korreksjon", "Retur", "Storno", "Void",
+  "Annuller" REVERSE a previously scanned item. Emit BOTH the original item line AND a separate line with
+  item_type "correction" and a negative line_total. Never delete the original and never move its price onto a
+  different item — the two lines must cancel out.
+- Self-check the arithmetic before answering: the sum of ALL line_total values must equal "total"
+  (allowing only for a rounding line). If it does not, re-read the receipt and lower "confidence".
+- If the image is blurry, cropped, or partly unreadable, extract what you can, set a LOW confidence, and
+  describe the problem in "notes".
+Output only the JSON object."#;
 
 #[derive(Deserialize, Default)]
 struct VlmStore {
     name: Option<String>,
     org_no: Option<String>,
+    address: Option<String>,
+    city: Option<String>,
+    postal_code: Option<String>,
+    country_code: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -92,6 +120,8 @@ struct VlmOut {
     mva_lines: Vec<VlmMva>,
     #[serde(default)]
     line_items: Vec<VlmItem>,
+    confidence: Option<f64>,
+    notes: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -115,6 +145,7 @@ fn item_type_of(s: &Option<String>) -> ItemType {
         Some("discount") => ItemType::Discount,
         Some("fee") => ItemType::Fee,
         Some("rounding") => ItemType::Rounding,
+        Some("correction") => ItemType::Correction,
         Some("unknown") => ItemType::Unknown,
         _ => ItemType::Product,
     }
@@ -127,6 +158,26 @@ fn price_type_of(s: &Option<String>) -> PriceType {
         Some("member") => PriceType::Member,
         Some("coupon") => PriceType::Coupon,
         _ => PriceType::NetOnly,
+    }
+}
+
+/// Best-effort currency for a country code, so a receipt whose currency the model
+/// left blank isn't silently mislabeled NOK (the app supports NOK/SEK/DKK/EUR/CHF/…).
+fn currency_for_country(cc: &str) -> Option<&'static str> {
+    match cc.trim().to_uppercase().as_str() {
+        "NO" => Some("NOK"),
+        "SE" => Some("SEK"),
+        "DK" => Some("DKK"),
+        "CH" | "LI" => Some("CHF"),
+        "GB" | "UK" => Some("GBP"),
+        "US" => Some("USD"),
+        "IS" => Some("ISK"),
+        "PL" => Some("PLN"),
+        "CZ" => Some("CZK"),
+        // Eurozone
+        "DE" | "FR" | "IT" | "ES" | "NL" | "BE" | "AT" | "FI" | "IE" | "PT" | "GR" | "LU" | "SK"
+        | "SI" | "EE" | "LV" | "LT" | "MT" | "CY" | "HR" => Some("EUR"),
+        _ => None,
     }
 }
 
@@ -143,6 +194,10 @@ fn empty_pdf_result(engine: &str) -> ExtractedReceipt {
     ExtractedReceipt {
         store_name_raw: None,
         org_no: None,
+        store_address: None,
+        store_city: None,
+        store_postal_code: None,
+        store_country_code: None,
         receipt_number: None,
         payment_method: None,
         purchase_at: None,
@@ -152,6 +207,7 @@ fn empty_pdf_result(engine: &str) -> ExtractedReceipt {
         total: None,
         line_items: vec![],
         confidence: Some(0.0),
+        notes: Some("PDF extraction not yet supported by the hosted VLM.".to_string()),
         engine: engine.to_string(),
         raw: serde_json::json!({ "note": "pdf extraction not yet supported by hosted VLM" }),
     }
@@ -270,18 +326,38 @@ impl ReceiptExtractor for HostedVlmExtractor {
             })
             .collect();
 
+        // Prefer the printed currency; if the model left it blank, infer from the
+        // store country before falling back to NOK (avoids mislabeling CHF/EUR as NOK).
+        let currency = out
+            .currency
+            .map(|c| c.trim().to_uppercase())
+            .filter(|c| !c.is_empty())
+            .or_else(|| {
+                out.store
+                    .country_code
+                    .as_deref()
+                    .and_then(currency_for_country)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "NOK".to_string());
+
         Ok(ExtractedReceipt {
             store_name_raw: out.store.name,
             org_no: out.store.org_no,
+            store_address: out.store.address,
+            store_city: out.store.city,
+            store_postal_code: out.store.postal_code,
+            store_country_code: out.store.country_code.map(|c| c.trim().to_uppercase()),
             receipt_number: out.receipt_number,
             payment_method: out.payment.method,
             purchase_at: parse_purchase_at(out.purchase_at.as_deref()),
-            currency: out.currency.unwrap_or_else(|| "NOK".to_string()),
+            currency,
             subtotal: dec2(out.subtotal),
             mva_total,
             total: dec2(out.total),
             line_items,
-            confidence: None,
+            confidence: out.confidence.map(|c| c.clamp(0.0, 1.0) as f32),
+            notes: out.notes.filter(|n| !n.trim().is_empty()),
             engine: self.engine.clone(),
             raw,
         })

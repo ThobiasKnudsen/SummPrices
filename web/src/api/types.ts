@@ -12,6 +12,7 @@ export type ItemType =
   | 'discount'
   | 'fee'
   | 'rounding'
+  | 'correction'
   | 'unknown';
 
 export interface User {
@@ -34,6 +35,10 @@ export interface ReceiptHeader {
   id: string;
   user_id: string;
   store_name_raw: string | null;
+  store_address: string | null;
+  store_city: string | null;
+  store_postal_code: string | null;
+  store_country_code: string | null;
   purchase_at: string | null;
   subtotal: string | null;
   mva_total: string | null;
@@ -42,6 +47,7 @@ export interface ReceiptHeader {
   extraction_status: ExtractionStatus;
   extraction_conf: number | null;
   needs_review: boolean;
+  review_reason: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -61,6 +67,7 @@ export interface Transaction {
 
 export interface TxWithContext extends Transaction {
   store_name_raw: string | null;
+  currency: string;
   purchase_at: string | null;
 }
 
@@ -76,6 +83,8 @@ export interface ReceiptSummary {
   total: string | null;
   currency: string;
   extraction_status: ExtractionStatus;
+  extraction_conf: number | null;
+  needs_review: boolean;
   created_at: string;
 }
 
@@ -111,4 +120,13 @@ export interface StoreSpending {
 
 export interface ByStoreResponse {
   stores: StoreSpending[];
+}
+
+export interface DebugModels {
+  current: string;
+  options: string[];
+}
+
+export interface ReprocessAllResponse {
+  queued: number;
 }
