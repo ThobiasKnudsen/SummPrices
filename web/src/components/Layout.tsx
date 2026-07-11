@@ -21,7 +21,7 @@ export function Layout() {
       <header className="sticky top-0 z-10 border-b border-slate-200 bg-white">
         <div className="mx-auto flex max-w-5xl items-center justify-between gap-4 px-4 py-3">
           <div className="flex items-center gap-6">
-            <span className="text-lg font-bold tracking-tight text-slate-900">SummPrices</span>
+            <span className="text-lg font-bold tracking-tight text-slate-900">SumPrices</span>
             <nav className="hidden items-center gap-1 sm:flex">
               {NAV_ITEMS.map((item) => (
                 <NavLink key={item.to} to={item.to} end={item.end} className={navClass}>

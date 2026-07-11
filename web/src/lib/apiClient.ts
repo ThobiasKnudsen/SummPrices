@@ -1,5 +1,5 @@
 const BASE_URL = (import.meta.env.VITE_API_BASE ?? 'http://localhost:3000').replace(/\/$/, '');
-const TOKEN_KEY = 'summprices_token';
+const TOKEN_KEY = 'sumprices_token';
 
 export function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY);

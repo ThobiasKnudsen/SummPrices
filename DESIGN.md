@@ -1,6 +1,6 @@
-# SummPrices — Design & Architecture
+# SumPrices — Design & Architecture
 
-> Canonical design context for SummPrices. Read this first. It records **what we're building and why**, the **decisions made** (with rationale), and the **open items**. The existing repo code and any older "spec" documents are **out of date** relative to this file — this file wins.
+> Canonical design context for SumPrices. Read this first. It records **what we're building and why**, the **decisions made** (with rationale), and the **open items**. The existing repo code and any older "spec" documents are **out of date** relative to this file — this file wins.
 >
 > Last updated: 2026-07-09.
 
@@ -8,7 +8,7 @@
 
 ## 1. Product
 
-**SummPrices** is a **personal "everything you buy" archive**. A user scans (or uploads) *any* receipt — groceries, furniture, electronics, a restaurant bill — and the app stores **the receipt image itself + structured line items**. Core consumer value:
+**SumPrices** is a **personal "everything you buy" archive**. A user scans (or uploads) *any* receipt — groceries, furniture, electronics, a restaurant bill — and the app stores **the receipt image itself + structured line items**. Core consumer value:
 
 - **Personal history & insight** — look back over time ("where did my money go"), filter by shop, by item, by date range; count how many times item Y was bought from START→END.
 - **Credit for contributing** — scanning receipts earns account credit. Viewing your *own* purchases is always free (see §7.7).
@@ -442,7 +442,7 @@ Not built at MVP; documented so we don't rediscover the need later:
 
 > **Post-MVP, directional.** Captured so we don't design the foundations into a corner. The MVP already accommodates it: `credit_ledger.reason` is an extensible enum, `users.trust_score` exists, and `products` + `raw_text_mappings` establish the crowdsourcing pattern. No MVP changes needed.
 
-Beyond receipts, SummPrices can become a **crowdsourced product-knowledge graph** — users earn credit not only for scanning but for *enriching* items, can *request* information, and a reputation system makes the data hard to corrupt.
+Beyond receipts, SumPrices can become a **crowdsourced product-knowledge graph** — users earn credit not only for scanning but for *enriching* items, can *request* information, and a reputation system makes the data hard to corrupt.
 
 - **Contributions (earn credit by enriching an item):** ingredients-list photo, a general product photo, weight / dimensions, a manual (furniture / Lego), etc. → a flexible `item_contributions` table (`product_id`, `attribute_type`, value / `asset_key`, `contributed_by`, `confidence`, verification status). Typed, so new attribute types are config, not migrations.
 - **Requests & demand-driven bounties:** users *request* a missing attribute (`info_requests`); **reward scales with demand** (more distinct requesters for the same attribute → higher credit) **and difficulty** (a photo is easy; provenance is hard). Fulfilment credits the contributor via a new `credit_ledger.reason` (`contribution_reward` / `bounty_reward`).

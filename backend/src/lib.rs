@@ -1,4 +1,4 @@
-//! SummPrices backend library. `main.rs` is a thin binary over this; integration
+//! SumPrices backend library. `main.rs` is a thin binary over this; integration
 //! tests (`tests/`) import it directly.
 use std::sync::Arc;
 

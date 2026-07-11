@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { getDebugModels } from '../api/receipts';
 
-const STORAGE_KEY = 'summprices_debug_model';
+const STORAGE_KEY = 'sumprices_debug_model';
 
 function readStored(): string {
   try {

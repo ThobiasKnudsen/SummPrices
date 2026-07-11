@@ -10,7 +10,7 @@ use crate::errors::AppError;
 use crate::extraction::{ExtractedReceipt, ReceiptExtractor};
 
 pub const DEV_USER_ID: Uuid = Uuid::from_u128(0xDE);
-pub const DEV_USER_EMAIL: &str = "dev@summprices.local";
+pub const DEV_USER_EMAIL: &str = "dev@sumprices.local";
 const SCAN_REWARD: i32 = 10;
 
 pub async fn ensure_dev_user(pool: &PgPool) -> Result<(), AppError> {

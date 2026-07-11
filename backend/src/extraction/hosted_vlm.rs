@@ -250,8 +250,8 @@ impl ReceiptExtractor for HostedVlmExtractor {
                 // attribution headers, ignored elsewhere.
                 req = req
                     .bearer_auth(key)
-                    .header("HTTP-Referer", "https://summprices.app")
-                    .header("X-Title", "SummPrices");
+                    .header("HTTP-Referer", "https://sumprices.app")
+                    .header("X-Title", "SumPrices");
             }
             match req.send().await {
                 Ok(r) if r.status().is_success() => {
