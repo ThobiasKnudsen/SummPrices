@@ -130,9 +130,11 @@ Tooling: `backend/src/bin/bench_extractors.rs` (score models on the reconciliati
 | `extraction_status` | pending, queued, processing, done, failed, needs_review |
 | `item_type` | product, deposit, discount, fee, rounding, unknown |
 | `fraud_status` | ok, suspected, confirmed, dismissed |
-| `ledger_reason` | scan_reward, price_query, signup_bonus, referral, adjustment, reversal |
+| `ledger_reason` | scan_reward, price_query, signup_bonus, referral, adjustment, reversal, barcode_reward |
 | `ledger_settle_state` | pending, settled, reversed |
 | `mapping_status` | proposed, approved, rejected |
+| `mapping_key_type` | plu, raw_text, ean |
+| `resolution_method` | unresolved, exact_ean, plu_map, fuzzy, barcode_scan, consensus, moderated |
 | `price_type` | shelf, promo, member, coupon, net_only |
 
 ### 7.1 Dimension tables (small, shared)
@@ -245,7 +247,10 @@ The `receipts` table **is** the extraction queue — the worker polls `WHERE ext
 | receipt_id | UUID | FK→receipts, NOT NULL, cascade delete | parent receipt |
 | user_id | UUID | FK→users, NOT NULL, cascade delete | dimension (denormalized for user queries) |
 | store_id | UUID | FK→stores | dimension (denormalized from receipt for per-store analytics) |
-| product_id | UUID | FK→products | dimension; NULL until resolved (the §4/#4 "unsure" seam) |
+| product_id | UUID | FK→products | dimension; NULL until resolved (§7.10 cascade) |
+| product_code | TEXT | | store's printed article/PLU code (or EAN) — Tier-0/1 resolution key (§7.10) |
+| resolution_method | `resolution_method` | NOT NULL, default 'unresolved' | how `product_id` was set (§7.10) |
+| resolution_confidence | REAL | | P(match) for a probabilistic (fuzzy) resolution; NULL for deterministic |
 | category_id | INT | FK→categories | dimension |
 | occurred_at | TIMESTAMPTZ | | denormalized `receipts.purchase_at` — for time queries |
 | line_no | INT | | order on the receipt |
@@ -270,7 +275,7 @@ The `receipts` table **is** the extraction queue — the worker polls `WHERE ext
 
 **There is no separate price table at MVP.** Every `transactions` row already *is* a price observation (`product_id` / `description_clean`, `store_id`, `occurred_at`, `unit_price`, `unit`, `currency`). A dedicated `price_history` table would be a ~1:1 duplicate of the biggest table, so:
 
-- **Crowd/market price queries = aggregate queries over `transactions`** (grouped by product × store × time), with **k-anonymity enforced** (only return aggregates backed by ≥ K distinct sources) and credit-metered at the API (§7.7). At MVP, the free "*your own* item Y over time" is just a `transactions` query on `(user_id, description_clean)` — no product resolution needed.
+- **Crowd/market price queries = aggregate queries over `transactions`** (grouped by **resolved `product_id`** × store × time — §7.10; unresolved / only-guessed lines don't enter the crowd index), governed by the §7.3.1 risk model and credit-metered at the API (§7.7). The free "*your own* item Y over time" needs **no** resolution — it's a `transactions` query on `(user_id, description_clean)` — but the **crowd** aggregate **requires** product resolution (§7.10), else the same item under N store spellings fragments into N "products."
 - **`current_prices` (latest price per product × store)** is *not* 1:1 — it collapses to one row per pair. If/when price search needs speed, add it as a **materialized view** over `transactions` (refresh periodically). Not needed at launch.
 
 **Price semantics — one item can have several prices at once.** Two shoppers can pay different amounts for the same item at the same store+time (member price, coupon, promo), so a price is not a single number. We model it per line from *what the receipt shows*:
@@ -348,19 +353,24 @@ A paper receipt prints *local* wall-clock time with no zone, but `purchase_at` s
 
 *Escrow (§7.9):* `scan_reward` posts `settle_state = 'pending'`; a settlement step (trivial/auto at MVP → async statistical batch later) flips it to `settled`, or a `reversal` entry claws it back. Cached `credit_balance` counts only `settled` deltas. Non-scan reasons default straight to `settled`.
 
-**`raw_text_mappings`** *(later)* — raw string → product, per store/chain, voted / moderated (the corrected "barcode bridge" — never global first-write-wins)
+**`product_mappings`** — the "barcode bridge": `(scope, key) → product`, from barcode scans / consensus / moderation. Powers the §7.10 resolution cascade (Tiers 1–3). Never global first-write-wins.
 
 | Column | Type | Key / Rules | Notes |
 |---|---|---|---|
 | id | UUID | PK | |
 | chain_id | UUID | FK→chains | scope to a chain… |
-| store_id | UUID | FK→stores | …or a specific store |
-| raw_text | TEXT | NOT NULL | |
+| store_id | UUID | FK→stores | …or a specific outlet (NULL = whole chain) |
+| key_type | `mapping_key_type` | NOT NULL | plu / raw_text / ean |
+| key_value | TEXT | NOT NULL | the PLU code, normalized raw text, or EAN |
 | product_id | UUID | FK→products, NOT NULL | |
+| method | `resolution_method` | NOT NULL | how it arose: barcode_scan / consensus / moderated / fuzzy |
+| confidence | REAL | | §7.9-style consensus confidence |
 | status | `mapping_status` | NOT NULL, default 'proposed' | |
-| votes | INT | NOT NULL, default 0 | |
+| votes | INT | NOT NULL, default 0 | independent corroborations |
 | proposed_by | UUID | FK→users | |
 | created_at | TIMESTAMPTZ | NOT NULL, default now() | |
+
+*Unique:* `(chain_id, store_id, key_type, key_value)` — one active mapping per key/scope. *Index:* `(chain_id, key_type, key_value)` for the Tier-1 lookup.
 
 **`review_queue`** *(later)* — receipts / items needing resolution. MVP uses the `needs_review` flags; a dedicated table + resolution UX comes later.
 
@@ -387,7 +397,7 @@ Not built at MVP; documented so we don't rediscover the need later:
 - **`consent_events`** — full GDPR consent audit trail (MVP uses columns on `users`).
 - **`data_requests`** — track GDPR export / deletion (DSAR) requests and their status.
 - **`devices`** — push-notification tokens (when notifications ship).
-- **`store_aliases`** — raw store-name → `store_id` resolution (part of the later identity-resolution flow, alongside `raw_text_mappings`).
+- **`store_aliases`** — raw store-name → `store_id` resolution (the store-side analog of `product_mappings` §7.10; part of the later identity-resolution flow).
 - **`receipt_tags` / notes** — user annotations on receipts.
 - **Item-enrichment tables** (`item_contributions`, `info_requests`, `contribution_verifications`) + KYC fields — the crowdsourced-enrichment vision (§14).
 
@@ -435,6 +445,28 @@ Low **fidelity** *gates* authenticity: you cannot judge a receipt you could not 
 - **P1 (crowd fills in):** corroboration LR + robust-Mahalanobis novelty; light EM for contributor precision; `txn_signature` cross-user dedup.
 - **P2 (adversarial maturity):** full hierarchical Bayesian truth-discovery w/ CIs; PU→supervised fraud classifier off accumulated labels; KYC priors; collusion-cluster detection; escrow settlement becomes real.
 
+### 7.10 Product resolution — receipt line → universal product (GTIN)
+
+*Receipt line names are cryptic, abbreviated, store-specific (`"H-MELK 1,75"`, `"TINE LETTMLK"`). For the **crowd Price index** (§7.3) to work, the same physical product under N store spellings must collapse to **one** product — else `grouped by product` fragments into garbage. **Personal** single-store analytics survive on `description_clean` alone; the **crowd asset cannot** — so resolution is load-bearing for the asset, not polish. It is structurally the **same truth-discovery problem as §7.9** (each key has a latent true GTIN; barcode scans are high-confidence votes; the matcher is a prior; consensus resolves it) and reuses that machinery (weighted consensus, escrow, trust-weighting).*
+
+**Resolution cascade — strongest/cheapest signal first.** Runs at ingest; re-runnable over history via `reprocess_all` as the matcher improves (so, unlike capture-provenance, the resolver itself *can* be back-applied — only the barcode **labels** benefit from being collected at the natural moment).
+
+1. **Tier 0 — free self-resolution.** When the receipt's printed `product_code` is a valid **EAN-13**, resolve straight to GTIN — no user, no model. (Barcoded goods often print the EAN; weighed goods print an internal PLU.) → `exact_ean`.
+2. **Tier 1 — deterministic `(chain_id, product_code)` PLU map. The backbone.** A store PLU is a stable key: once *any* signal resolves `(chain, PLU) → product`, **every future line with that PLU, across all users, resolves with near-certainty** — a `product_mappings` lookup (`key_type = plu`). After a short warm-up this resolves the *majority* of recurring grocery lines, nearly free. → `plu_map`.
+3. **Tier 2 — probabilistic string match ("guess with statistics").** No known PLU map → fuzzy/semantic match of `description_clean` (+ brand tokens, qty/unit, price band) against known products → **candidate GTIN + calibrated `P(match)`**. Start with Postgres **`pg_trgm`** trigram similarity (no embeddings infra); calibrate similarity→probability (Platt/isotonic) on the barcode-scan labels — the same calibration trick as §7.9 fidelity. → `fuzzy`.
+4. **Tier 3 — barcode scan = gold label, earns credit.** User scans the item barcode → writes a certain `(chain, product_code)→GTIN` **and** `raw_text→GTIN` mapping (`method = barcode_scan`), which **propagates** to all past & future lines sharing that key. → `barcode_scan`.
+
+**The flywheel.** Tier-3 scans are the ground-truth labels that **train & calibrate Tier 2**; Tier-1 PLU maps fall out for free. Same crowd-labels → self-improving-model loop as the LoRA extractor (§6.1) and the trust model (§7.9).
+
+**Credit = value of information, not flat.** Pay **more** to scan an item currently *ambiguous & frequently purchased* (high info-gain), **little** for an already-resolved one — mirrors §14's `demand × difficulty × info-gain`. Maximizes label value **and** removes the farming incentive. `ledger_reason = barcode_reward`, posted through **escrow** (§7.9 `settle_state`).
+
+**A scan is a *claim* — anti-fraud reuses §7.9.** Provisional (escrow) → settles on **independent corroboration** (other users scanning the same PLU → same GTIN, trust-weighted consensus). Cheap sanity gate: fuzzy-match the *scanned GTIN's known product name* against the receipt line — a `"melk"` line + a Coca-Cola barcode → reject/flag. Anti-farming is the same lever as the value-of-information reward.
+
+**The gate (ruling): probabilistic guesses power PERSONAL freely, the CROWD only on corroboration.** A Tier-2 `fuzzy` match sets `transactions.product_id` + `resolution_confidence` and immediately powers the user's *own* analytics ("you've bought this 6×") — low-stakes; a wrong guess is a shrug. But a line **counts toward the crowd/Price-API index only if resolved deterministically (Tier 0/1) or corroborated by a scan** — never on a bare guess. Same two-gate principle as §7.9 (personal permissive, crowd strict); protects the asset from confident-but-wrong auto-resolutions.
+
+**MVP scope (ruling — seam + label mechanism + cheap tiers):** Tier 0 + Tier 1 + a simple `pg_trgm` Tier 2; the barcode-scan endpoint + escrowed `barcode_reward`; the `product_mappings` table; `transactions.product_code` + `resolution_confidence` + `resolution_method`.
+**Later:** embedding/semantic matcher; full multi-user weighted-consensus resolution; **GTIN → Open Food Facts / GS1 enrichment** (name/brand/image from a scanned barcode); cross-chain product unification at scale; bounties for *requested* scans (§14).
+
 ## 8. GDPR & compliance (hard constraints)
 
 - Receipts can be **Article 9 special-category** data (pharmacy → health, etc.) → treat the corpus as sensitive; use **explicit consent** as the lawful basis.
@@ -460,10 +492,10 @@ Low **fidelity** *gates* authenticity: you cannot judge a receipt you could not 
 ## 11. Roadmap (phased)
 
 **Launch (MVP)**
-- Auth (+ `refresh_tokens`); capture/upload (photo **and manual digital-PDF upload**); durable extraction queue (on `receipts`) + self-hosted VLM; validators + confidence gate + `needs_review`; personal archive with filtering (by shop / item / date range) and spend analytics; credit ledger (earn on scan); basic price search as credit-metered aggregate queries over `transactions`; export; GDPR basics (consent, export, delete-with-cascade).
+- Auth (+ `refresh_tokens`); capture/upload (photo **and manual digital-PDF upload**); durable extraction queue (on `receipts`) + self-hosted VLM; validators + confidence gate + `needs_review`; **product resolution** (Tier-0/1 deterministic + `pg_trgm` Tier-2 guess + barcode-scan-for-credit, §7.10); personal archive with filtering (by shop / item / date range) and spend analytics; credit ledger (earn on scan **+ barcode scan**); basic price search as credit-metered aggregate queries over `transactions`; export; GDPR basics (consent, export, delete-with-cascade).
 
 **Later**
-- Email/mailbox digital-receipt ingestion; item-uncertainty **resolution flow** + per-store `raw_text_mappings` (crowd/vote); chain-API opt-in import; "overpaying" comparisons; TimescaleDB for the price series; B2B paid Price API + dashboard; richer product/store identity resolution; international expansion; **crowdsourced item enrichment + demand-driven bounties + reputation/KYC (§14)**.
+- Email/mailbox digital-receipt ingestion; **advanced product resolution** (embedding/semantic matcher, multi-user weighted-consensus, GTIN→Open Food Facts/GS1 enrichment, §7.10); chain-API opt-in import; "overpaying" comparisons; TimescaleDB for the price series; B2B paid Price API + dashboard; richer product/store identity resolution; international expansion; **crowdsourced item enrichment + demand-driven bounties + reputation/KYC (§14)**.
 
 ## 12. Open items / next steps
 
@@ -514,11 +546,12 @@ Low **fidelity** *gates* authenticity: you cannot judge a receipt you could not 
 | 2026-07-11 | **Debug tooling** (on `debug` branch): in-app model picker (`/api/debug/models`, `VLM_MODELS`), per-receipt Rescan + bulk `/api/debug/reprocess-all`, `bench_extractors`/`reprocess_all` bins, zoomable receipt viewer, confidence pill | A/B models against the reconciliation metric on live receipts; inspect/re-run without a redeploy |
 | 2026-07-11 | **Cost/self-hosting roadmap set (§6.1):** Flash-first → always-on Qwen3-VL-8B/Qwen2.5-VL-7B on one L4 (~$0.012/rcpt) → LoRA fine-tune on the review-queue labels (~$0.002/rcpt). Avoid Llama-3.2-Vision (EU license carve-out) | ~$0.10/rcpt hosted won't scale to 1000/day; the reconciliation gate makes cheap/small models viable; fine-tune on our own data is the accuracy+cost moat |
 | 2026-07-11 | **Receipt trust model (§7.9):** trust = **three independent statistical signals, not one score** — Fidelity (calibrated reconciliation), Authenticity (corroboration likelihood-ratio + robust-Mahalanobis novelty + dedup-as-LR), Reliability (hierarchical Bayesian truth-discovery + robust weighted aggregation); combined in **log-odds**, consumed by **two gates** (credit vs Price-API index-inclusion); enforced only where value crosses a membrane, never on the personal archive. Seams pulled to MVP: irreversible **capture-provenance** logging (`captured_at`/`capture_meta`), **escrow credit** (`ledger_settle_state`), `receipts.authenticity_score` | User: all three needed but **kept separate**, and **at least authenticity + reliability must be statistical**. The arithmetic gate proves transcription fidelity, not authenticity; the crowd price index doubles as the fraud detector (corroboration), so it self-activates as data accrues. Both MVP seams approved (capture provenance is un-backfillable; escrow is cheap now / painful later) |
+| 2026-07-11 | **Product resolution (§7.10) is MVP:** receipt line → GTIN — the crowd index *depends* on it (raw strings fragment the asset; §7.3 previously assumed resolution existed but deferred it — inconsistency fixed). Cascade: Tier-0 EAN self-resolve → Tier-1 deterministic `(chain, product_code)` PLU map → Tier-2 `pg_trgm` probabilistic guess → Tier-3 **barcode-scan-for-credit** gold label (value-of-information reward, escrowed, corroborated). **Probabilistic guesses power *personal* freely but feed the *crowd* only on deterministic/corroborated resolution** (same two-gate rule as §7.9). New schema: `product_mappings` table (generalizes the old `raw_text_mappings`), `transactions.product_code`/`resolution_method`/`resolution_confidence`, `barcode_reward` reason | User flagged the gap; barcode scans are the ground-truth label flywheel (calibrate Tier-2, à la §6.1/§7.9); a scan is a claim → reuse §7.9 consensus + escrow anti-fraud |
 | 2026-07-11 | **Price API privacy model (§7.3.1):** aggregate-query-only (no per-receipt endpoint); per-item independent cells with a **no-co-occurrence** rule; availability by a re-id **risk formula** (`ρ=1/n`, Poisson population-uniqueness) not a fixed K; **differential privacy** (ε budget) on price *and* volume; resolution is a shared budget traded across area/time/price; enforced at the query layer + a locked-down DB role over the same `transactions` (no schema change; receipts stay full-detail per user) | User's design; makes the price domain provably *anonymous* not just pseudonymous, keeps it commercially useful, and needs no data duplication at MVP |
 
 ## 14. Future vision — crowdsourced item enrichment & reputation
 
-> **Post-MVP, directional.** Captured so we don't design the foundations into a corner. The MVP already accommodates it: `credit_ledger.reason` is an extensible enum, `users.trust_score` exists, and `products` + `raw_text_mappings` establish the crowdsourcing pattern. No MVP changes needed.
+> **Post-MVP, directional.** Captured so we don't design the foundations into a corner. The MVP already accommodates it: `credit_ledger.reason` is an extensible enum, `users.trust_score` exists, and `products` + `product_mappings` (§7.10, now MVP) establish the crowdsourcing pattern.
 
 Beyond receipts, SumPrices can become a **crowdsourced product-knowledge graph** — users earn credit not only for scanning but for *enriching* items, can *request* information, and a reputation system makes the data hard to corrupt.
 
