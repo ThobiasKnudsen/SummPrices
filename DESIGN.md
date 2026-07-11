@@ -131,6 +131,7 @@ Tooling: `backend/src/bin/bench_extractors.rs` (score models on the reconciliati
 | `item_type` | product, deposit, discount, fee, rounding, unknown |
 | `fraud_status` | ok, suspected, confirmed, dismissed |
 | `ledger_reason` | scan_reward, price_query, signup_bonus, referral, adjustment, reversal |
+| `ledger_settle_state` | pending, settled, reversed |
 | `mapping_status` | proposed, approved, rejected |
 | `price_type` | shelf, promo, member, coupon, net_only |
 
@@ -213,6 +214,8 @@ Note: `gtin` is the universal item id when a barcode exists; many receipt lines 
 | store_name_raw | TEXT | | extracted store text; shown even if unresolved |
 | purchase_at | TIMESTAMPTZ | | universal instant of purchase (§7.4 timezone rules) |
 | capture_timezone | TEXT | | client device tz at upload — VPN-safe fallback for `purchase_at` |
+| captured_at | TIMESTAMPTZ | | client clock at capture — authenticity provenance (§7.9), un-backfillable |
+| capture_meta | JSONB | | client-reported provenance: has-EXIF, EXIF datetime, camera-vs-file-pick, app version, capture→upload latency (§7.9) |
 | currency | TEXT | NOT NULL, default 'NOK' | |
 | subtotal / mva_total / total | NUMERIC(12,2) | | |
 | extraction_status | `extraction_status` | NOT NULL, default 'pending' | pipeline state |
@@ -223,6 +226,7 @@ Note: `gtin` is the universal item id when a barcode exists; many receipt lines 
 | image_phash | BIT(64) | | perceptual hash — near-duplicate images |
 | dedup_signature | TEXT | UNIQUE(user_id, dedup_signature) | hash(user, store, date, total, item_count) |
 | txn_signature | TEXT | | hash(org_no, purchase_at, total) — cross-user dup (later) |
+| authenticity_score | REAL | | 0–1 statistical authenticity (§7.9); `fraud_status` = its thresholded label |
 | fraud_status | `fraud_status` | NOT NULL, default 'ok' | |
 | extraction_attempts | INT | NOT NULL, default 0 | retry counter for the queue |
 | extraction_error | TEXT | | last failure message |
@@ -334,12 +338,15 @@ A paper receipt prints *local* wall-clock time with no zone, but `purchase_at` s
 | user_id | UUID | FK→users, NOT NULL, cascade delete | |
 | delta | INT | NOT NULL | `+` earn, `−` spend |
 | reason | `ledger_reason` | NOT NULL | |
+| settle_state | `ledger_settle_state` | NOT NULL, default 'settled' | escrow seam (§7.9); spendable `credit_balance` = Σ delta WHERE settled |
 | ref_type | TEXT | | 'receipt', 'price_query', … |
 | ref_id | TEXT | | receipt / query id |
 | balance_after | INT | NOT NULL | running balance (audit) |
 | created_at | TIMESTAMPTZ | NOT NULL, default now() | |
 
 *Constraint:* `UNIQUE(user_id, ref_id) WHERE reason = 'scan_reward'` → a receipt is rewarded **at most once**.
+
+*Escrow (§7.9):* `scan_reward` posts `settle_state = 'pending'`; a settlement step (trivial/auto at MVP → async statistical batch later) flips it to `settled`, or a `reversal` entry claws it back. Cached `credit_balance` counts only `settled` deltas. Non-scan reasons default straight to `settled`.
 
 **`raw_text_mappings`** *(later)* — raw string → product, per store/chain, voted / moderated (the corrected "barcode bridge" — never global first-write-wins)
 
@@ -358,6 +365,8 @@ A paper receipt prints *local* wall-clock time with no zone, but `purchase_at` s
 **`review_queue`** *(later)* — receipts / items needing resolution. MVP uses the `needs_review` flags; a dedicated table + resolution UX comes later.
 
 ### 7.6 Anti-fraud & de-duplication
+
+> The signals below are the **authenticity** axis of the trust model; §7.9 is the full statistical framing (three signals, two gates) that this feeds.
 
 Because scanning earns spendable credit, dedup/anti-fraud is **layered** (stronger than a single hash):
 
@@ -381,6 +390,50 @@ Not built at MVP; documented so we don't rediscover the need later:
 - **`store_aliases`** — raw store-name → `store_id` resolution (part of the later identity-resolution flow, alongside `raw_text_mappings`).
 - **`receipt_tags` / notes** — user annotations on receipts.
 - **Item-enrichment tables** (`item_contributions`, `info_requests`, `contribution_verifications`) + KYC fields — the crowdsourced-enrichment vision (§14).
+
+### 7.9 Receipt trust — three statistical signals, two gates
+
+*How SumPrices decides how far to trust a receipt. **Trust is not one number.** A receipt can be perfectly read but fabricated, or genuine but misread — collapsing that into a single score destroys the *reason*, which both the review queue and the B2B "price + confidence" claim need. So we compute **three independent, individually-inspectable signals** and let the two value-exits consume them differently. Trust is only enforced where **value crosses a membrane** — earning spendable credit, or a row entering the crowd/Price-API aggregate (§7.3.1); a user's own archive is **never** gated (§7.7).*
+
+**The three signals.** Each is a calibrated probability/score with its own home column:
+
+| Signal | Question / threat | Method (★ = statistical) | Output |
+|---|---|---|---|
+| **Fidelity** | Did we *read* it right? (VLM error) | Reconciliation residual + field/model confidence → ★ logistic **calibration** | `receipts.extraction_conf`, `transactions.confidence` |
+| **Authenticity** | Is it a *genuine record of a real purchase*? (fabrication, tampering, AI-gen, duplication) | ★ Corroboration likelihood-ratio + ★ robust novelty detection + dedup-as-LR | `receipts.authenticity_score` → thresholded to `fraud_status` |
+| **Reliability** | How much should it *move the crowd price*? (unrepresentative data, low-rep contributor) | ★ Hierarchical Bayesian truth-discovery + robust weighted aggregation | `users.trust_score` (contributor) + per-observation weight (derived at aggregation) |
+
+**The arithmetic gate proves fidelity, not authenticity.** `Σ(line totals) == total` shows the *transcription is self-consistent* — but a fabricated receipt makes the arithmetic add up *by construction*. Reconciliation says nothing about whether the purchase happened; authenticity is a separate, adversarial problem.
+
+**Evidence combines in log-odds.** Each signal within an axis is a *weight of evidence* `log[P(sig|true)/P(sig|false)]`; the sum is a posterior log-odds (naive-Bayes form) → additive, **inspectable** (which term sank it), **calibrated**, and **graceful under missing signals** (absent = 0 evidence, so cold-start doesn't break). Once the review queue + reversals yield labels, replace hand-set weights with a fitted **logistic/GBM** (relaxes the naive-independence assumption). **Two gates consume the signals differently:**
+- **Credit gate** (`scan_reward`): fidelity × authenticity × dedup. Fail → no/partial credit + `needs_review`.
+- **Index-inclusion gate** (row counts toward the Price-API aggregate, §7.3.1): authenticity × reliability-weight, fidelity as a precondition. A low-authenticity / low-weight row is down-weighted or excluded from the *crowd*, but still lives in the owner's archive.
+
+**Authenticity — statistical (label trajectory: unsupervised → PU → supervised).** No fraud labels exist at launch, so it starts label-free and matures as the review queue + credit reversals accrue weak labels.
+1. **Corroboration LR — the index doing double duty.** Per line, `WoE = log[ f_genuine(price | robust crowd density for product×store×week) / f_null(price | broad category prior) ]`, summed across lines (≈ independent given store+week) → a receipt-level authenticity LR. `f_genuine` = robust density on **log-price** (Student-t / small mixture for promo modes, MAD scale); `f_null` deliberately wide. **Cold-start self-heals:** thin crowd → wide `f_genuine` → WoE ≈ 0 → falls back to prior + rules. The asset you sell *is* the fraud detector, switching itself on as data accrues.
+2. **Novelty detection** on receipt-level features (huge genuine class, ~no negatives → one-class): **robust Mahalanobis (MCD covariance) → χ² tail p-value** over capture channel (live camera vs gallery), time-of-day vs store hours, a user's scan inter-arrival (bursts = farming), MVA-table consistency, item-count-vs-total, EAN-resolvability. Upgrade to Isolation Forest later.
+3. **Duplicates as LR, not equality.** `image_phash` Hamming + fuzzy `txn_signature` → `log[P(d|same)/P(d|diff)]`. Same-transaction-different-user (`txn_signature`) is the highest-value fraud signal.
+
+Low **fidelity** *gates* authenticity: you cannot judge a receipt you could not read → route to review, never auto-reject.
+
+**Reliability — statistical (the §14 truth-discovery layer, made concrete).**
+- **Contributor reliability = *continuous* truth-discovery, not categorical Dawid–Skene.** Prices are continuous, so the DS analogue is a **hierarchical Bayesian measurement model** (CRH / CATD family): latent true price per `store×window` + per-contributor **bias & precision** as random effects, fit by **batch EM** (nightly). `users.trust_score` = estimated precision, earned from agreement-with-inferred-truth over time. It yields a **confidence interval on every aggregate for free** — that CI *is* the B2B product (§7.3.1's "price + confidence").
+- **Robust weighted aggregation.** Published crowd price for a cell = **weighted median / Huber M-estimator**, weights = `trust_score × recency-decay × authenticity`. Robustness does double duty: rejects honest outliers (clearance/damaged) *and* its high breakdown point is the **anti-poisoning** defense (a few adversarial rows can't move a weighted median). Stratify by `price_type` (§7.3) — never average shelf against member.
+- **KYC = strong prior on precision, not an oracle** (§14): starts a contributor high, still updated by track record, **hard cap on any single actor's weight** (influence-function guardrail against one KYC'd bad actor).
+
+**Fidelity — calibration only (kept light, per the "at least authenticity + reliability" call).** Turn the hard `±0.55` reconciliation threshold into `p_fidelity = σ(β₀ + β₁·|residual| + β₂·min_field_conf + …)` fit by **Platt/isotonic** on the labeled queue; the threshold becomes a **cost-matrix decision** (false-accept cost vs human-review cost). Same labels feed the LoRA flywheel (§6.1).
+
+**One loop, three outputs.** Crowd prices power authenticity's corroboration LR → authenticity weights feed reliability's robust aggregation → reliability's converged truth re-scores contributors → sharper authenticity priors next round.
+
+**Schema seams pulled to MVP** (all additive, nearly free; one *irreversible*):
+- **Capture provenance** *(irreversible — un-backfillable)*: the client records `receipts.captured_at` (device clock at capture) + `receipts.capture_meta` JSONB (has-EXIF, EXIF datetime, in-app-camera vs file-pick beyond the `receipt_source` split, app version, capture→upload latency). Nothing consumes it at MVP; without it every pre-launch receipt is permanently featureless for novelty scoring.
+- **Escrow credit seam** *(§7.6 "later" — seam now)*: `credit_ledger.settle_state` (`pending`/`settled`/`reversed`); spendable `credit_balance` = Σ delta **where settled**. `scan_reward` posts `pending`; the settlement step (trivial/auto now → async statistical batch later) flips to `settled` or posts a `reversal`. Cheap now, painful to retrofit once credit is live.
+- **`receipts.authenticity_score` REAL** — the statistical output; `fraud_status` becomes its thresholded label + human-review outcome. Reliability's per-observation weight is **derived at aggregation** (trust_score × recency × authenticity), not stored — keeps the biggest table lean (consistent with §7.3 "derive, don't duplicate").
+
+**Phasing (statistical maturity, cost-aware).**
+- **P0 (MVP):** calibrated fidelity + deterministic sanity (date-not-future, legal MVA rates, sane totals, currency-matches-country, **org-no checked against the Brønnøysund Enhetsregister** — free EU-resident API) + dedup-as-LR. Authenticity = prior + rules; reliability = robust weighted median, flat weights. Escrow + provenance seams present.
+- **P1 (crowd fills in):** corroboration LR + robust-Mahalanobis novelty; light EM for contributor precision; `txn_signature` cross-user dedup.
+- **P2 (adversarial maturity):** full hierarchical Bayesian truth-discovery w/ CIs; PU→supervised fraud classifier off accumulated labels; KYC priors; collusion-cluster detection; escrow settlement becomes real.
 
 ## 8. GDPR & compliance (hard constraints)
 
@@ -460,6 +513,7 @@ Not built at MVP; documented so we don't rediscover the need later:
 | 2026-07-11 | `persist_extraction` made atomic under a per-receipt `FOR UPDATE` lock; rescan endpoints atomically claim (in-flight guard, 2-min stale escape) | Adversarial review found concurrent rescans duplicated line items and an unbounded (denial-of-wallet) rescan loop |
 | 2026-07-11 | **Debug tooling** (on `debug` branch): in-app model picker (`/api/debug/models`, `VLM_MODELS`), per-receipt Rescan + bulk `/api/debug/reprocess-all`, `bench_extractors`/`reprocess_all` bins, zoomable receipt viewer, confidence pill | A/B models against the reconciliation metric on live receipts; inspect/re-run without a redeploy |
 | 2026-07-11 | **Cost/self-hosting roadmap set (§6.1):** Flash-first → always-on Qwen3-VL-8B/Qwen2.5-VL-7B on one L4 (~$0.012/rcpt) → LoRA fine-tune on the review-queue labels (~$0.002/rcpt). Avoid Llama-3.2-Vision (EU license carve-out) | ~$0.10/rcpt hosted won't scale to 1000/day; the reconciliation gate makes cheap/small models viable; fine-tune on our own data is the accuracy+cost moat |
+| 2026-07-11 | **Receipt trust model (§7.9):** trust = **three independent statistical signals, not one score** — Fidelity (calibrated reconciliation), Authenticity (corroboration likelihood-ratio + robust-Mahalanobis novelty + dedup-as-LR), Reliability (hierarchical Bayesian truth-discovery + robust weighted aggregation); combined in **log-odds**, consumed by **two gates** (credit vs Price-API index-inclusion); enforced only where value crosses a membrane, never on the personal archive. Seams pulled to MVP: irreversible **capture-provenance** logging (`captured_at`/`capture_meta`), **escrow credit** (`ledger_settle_state`), `receipts.authenticity_score` | User: all three needed but **kept separate**, and **at least authenticity + reliability must be statistical**. The arithmetic gate proves transcription fidelity, not authenticity; the crowd price index doubles as the fraud detector (corroboration), so it self-activates as data accrues. Both MVP seams approved (capture provenance is un-backfillable; escrow is cheap now / painful later) |
 | 2026-07-11 | **Price API privacy model (§7.3.1):** aggregate-query-only (no per-receipt endpoint); per-item independent cells with a **no-co-occurrence** rule; availability by a re-id **risk formula** (`ρ=1/n`, Poisson population-uniqueness) not a fixed K; **differential privacy** (ε budget) on price *and* volume; resolution is a shared budget traded across area/time/price; enforced at the query layer + a locked-down DB role over the same `transactions` (no schema change; receipts stay full-detail per user) | User's design; makes the price domain provably *anonymous* not just pseudonymous, keeps it commercially useful, and needs no data duplication at MVP |
 
 ## 14. Future vision — crowdsourced item enrichment & reputation
